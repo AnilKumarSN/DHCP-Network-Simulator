@@ -1,196 +1,253 @@
-# Dual Stack DHCP Client Simulator
+# Advanced DHCP Environment with Python Relay Agent & Multi-VRF Kea Servers
 
-This script simulates multiple dual-stack (DHCPv4 and DHCPv6) clients, each operating within its own network namespace. It uses ISC Kea's `perfdhcp` tool to generate DHCP traffic. This is useful for testing DHCP server performance and functionality at scale.
+## 1. Project Overview
 
-## Features
+This project provides a sophisticated testing and development environment for advanced DHCP scenarios. It features:
 
-*   Simulates a configurable number of DHCP clients.
-*   Each client operates in an isolated network namespace.
-*   Supports both DHCPv4 and DHCPv6 traffic generation via `perfdhcp`.
-*   Customizable rate, duration, and packet templates for `perfdhcp`.
-*   Logs output from each `perfdhcp` instance to separate files.
-*   Automatic setup and cleanup of network namespaces and virtual Ethernet (veth) interfaces.
+*   **Isolated Kea DHCP Servers**: Multiple ISC Kea DHCP server instances (both DHCPv4 and DHCPv6) run in separate Linux network namespaces (`ns_red`, `ns_blue`), simulating distinct VRFs (Virtual Routing and Forwarding instances) or isolated network segments, allowing for overlapping IP address spaces if needed and independent server configurations.
+*   **Custom Python-Based DHCP Relay Agent (`dhcp_pyrelay.py`)**: A central component of this project is an in-house developed DHCP relay agent written in Python. This relay:
+    *   Listens for client DHCP requests on a shared client network segment.
+    *   Implements intelligent "bookkeeping" and policy logic to determine which VRF (i.e., which Kea server namespace - RED or BLUE) a client request should be forwarded to.
+    *   Dynamically inserts or modifies DHCP options (e.g., Option 82 for DHCPv4, Interface-ID for DHCPv6) into client packets before relaying them. These options are used by Kea servers for fine-grained client classification and targeted subnet/pool selection.
+    *   Handles the relaying of server replies back to the correct clients, stripping any options it had inserted.
+*   **Orchestration Script (`kea_server_setup.sh`)**: A comprehensive Bash script automates the entire environment lifecycle:
+    *   Creation of network namespaces for Kea servers and the Python relay.
+    *   Setup of Linux bridges for client-side and server-side communication.
+    *   Configuration and connection of virtual Ethernet (veth) pairs.
+    *   Dynamic generation of Kea DHCP server configuration files.
+    *   Launching Kea server processes.
+    *   Launching the Python DHCP relay agent.
+    *   Stopping all processes and cleaning up the network environment.
+*   **Client Simulation (`dhcp_simulator.py` & `perfdhcp`)**: The existing `dhcp_simulator.py` (using Kea's `perfdhcp` tool) can be used to generate client traffic at scale to test the relay and server setup.
 
-## Prerequisites
+The primary goal is to create a flexible and controllable testbed for developing and validating advanced DHCP relaying policies, Kea server classification features, and interactions in a multi-VRF context.
 
-1.  **Linux System**: Required for network namespace and `iproute2` functionalities.
-2.  **Python 3**: The simulator script is written in Python 3.
-3.  **`iproute2`**: The `ip` command is used extensively for network configuration. Install it if not present (e.g., `sudo apt install iproute2`).
-4.  **ISC Kea `perfdhcp`**: The `perfdhcp` executable must be installed and accessible.
-    *   The provided `setup_kea.sh` script can be used to install Kea 3.0.0, including `perfdhcp` (typically installed to `/usr/sbin/perfdhcp`). Ensure this script is run first if Kea is not already installed.
-5.  **Root Privileges**: The script `dhcp_simulator.py` must be run as root (or with `sudo`) because it creates network namespaces and manipulates network interfaces.
-6.  **Target DHCP Server(s)**: You need one or more DHCP servers (v4 and/or v6) configured and reachable on the network segment where the simulated clients will appear.
+## 2. Design Philosophy & Goals
 
-## Setup
+*   **Isolation**: Simulate real-world network segmentation (VRFs) using network namespaces to ensure Kea server instances operate independently.
+*   **Intelligent Relaying**: Move beyond basic relaying by implementing custom logic within the Python relay to make policy-based decisions for server selection and option manipulation.
+*   **Targeted Allocation**: Enable precise control over which subnet/pool a client receives an IP address from, based on client characteristics and relay-defined policies.
+*   **Kea Feature Validation**: Provide an environment to test and understand Kea's advanced features like `shared-networks`, client classification based on relay-inserted options (Option 82, Interface-ID, etc.).
+*   **Extensibility**: Build a modular Python relay that can be extended with more complex policies and "bookkeeping" logic in the future.
+*   **Automation**: Use `kea_server_setup.sh` to ensure repeatable and manageable setup/teardown of the complex environment.
 
-### 1. Install Kea and `perfdhcp`
+## 3. Architecture & Network Design
 
-If you don't have Kea 3.0.0 and `perfdhcp` installed, use the `setup_kea.sh` script:
-
-```bash
-chmod +x setup_kea.sh
-sudo ./setup_kea.sh
 ```
-This will install the necessary Kea components, including `perfdhcp` (usually at `/usr/sbin/perfdhcp`).
++------------------------------------------------------------------------------------------------------+
+| HOST MACHINE                                                                                         |
+|                                                                                                      |
+|  +----------------------------+      +----------------------------+      +--------------------------+
+|  | Namespace: ns_red          |      | Namespace: ns_blue         |      | Namespace: ns_pyrelay    |
+|  | (VRF RED Kea Servers)      |      | (VRF BLUE Kea Servers)     |      | (Python DHCP Relay Agent)|
+|  |                            |      |                            |      |                          |
+|  | +------------------------+ |      | +------------------------+ |      | +----------------------+ |
+|  | | Kea DHCPv4 (red_cfg)   | |      | | Kea DHCPv4 (blue_cfg)  | |      | | dhcp_pyrelay.py      | |
+|  | | Kea DHCPv6 (red_cfg)   | |      | | Kea DHCPv6 (blue_cfg)  | |      | | (Policy Engine &     | |
+|  | +------------------------+ |      | +------------------------+ |      | |  Option Manipulation)  | |
+|  |            |               |      |            |               |      | +----------------------+ |
+|  |      veth_red_ns           |      |      veth_blue_ns          |      |      |           |       |
+|  +------------|----------------+      +------------|----------------+      | v_pyrelay_c_ns | v_pyrelay_s_ns |
+|               | (on br_dhcp_test)      (on br_dhcp_test)             (on br_clients)  (on br_dhcp_test)
+|               |                               |                               |        |       |
+|               +-------------------------------+-------------------------------+        |       |
+|                                               |                                        |       |
+|                    +----------------------------------------------------------+        |       |
+|                    | Linux Bridge: br_dhcp_test (Server/Relay Backend Network)|<-------+       |
+|                    +----------------------------------------------------------+                |
+|                                                                                                |
+|                    +----------------------------------------------------------+                |
+|                    | Linux Bridge: br_clients (Shared Client Access Network)   |<---------------+
+|                    +----------------------------------------------------------+
+|                                                 |
+|    +--------------------------+                 |
+|    | Namespace: client_X      |<----------------+
+|    | (dhclient / perfdhcp)    |
+|    |      veth_clientX_ns     |
+|    +--------------------------+
+|           (Multiple such client namespaces)
+|                                                                                                      |
++------------------------------------------------------------------------------------------------------+
+```
 
-### 2. Prepare Host Network
+**Key Architectural Decisions & Reasoning:**
 
-The simulated clients connect to the host network via virtual Ethernet (veth) pairs. The host-facing end of these veth pairs needs to be connected to the network segment where your DHCP server(s) reside.
+*   **Network Namespaces for VRF Simulation**: Each Kea server set (RED and BLUE) runs in its own namespace. This provides strong isolation, allowing independent configurations, lease databases, and even overlapping IP subnets if the VRF scenario required it (though current example uses distinct subnets). The Python relay also runs in its own namespace (`ns_pyrelay`) to isolate its network interfaces and routing table.
+*   **Linux Bridges for L2 Segmentation**:
+    *   `br_dhcp_test`: Simulates a "backend" or "core" network segment where the Kea DHCP servers and the server-facing interface of the Python relay reside. This allows direct IP communication between the relay and the servers.
+    *   `br_clients`: Simulates a shared "access" network or VLAN where all DHCP clients connect. The client-facing interface of the Python relay connects here to listen for client broadcasts/multicasts.
+*   **Custom Python DHCP Relay Agent (`dhcp_pyrelay.py`)**:
+    *   **Necessity**: Standard relay agents (like `isc-dhcp-relay`) are excellent for forwarding but typically offer limited built-in logic for dynamic server selection based on complex client attributes or for highly customized DHCP option insertion beyond basic Option 82 templating. This project requires the relay to be the "brains" for VRF mapping and policy-based option insertion.
+    *   **Functionality**: It inspects client packets, applies a policy engine (initially MAC/DUID-based) to select a target VRF (RED/BLUE server), then further applies policy to determine what options (e.g., Option 82 Circuit ID, DHCPv6 Interface-ID) to insert to guide the chosen Kea server in its subnet/pool selection. It also handles stripping these options from server replies.
+*   **Kea DHCP Servers**: Chosen for their modern design, extensive feature set, and powerful client classification capabilities which are essential for acting upon the information inserted by our Python relay. The `shared-networks` feature is critical for allowing a single Kea server interface to serve multiple logical subnets.
+*   **Orchestration via Bash (`kea_server_setup.sh`)**: A shell script is sufficient and practical for orchestrating the setup, startup, and teardown of network elements and processes in this Linux-based environment.
 
-A common way to achieve this is to use a **Linux bridge**:
+## 4. Detailed Information Flow
 
-1.  **Create a bridge** (e.g., `br0`):
+### 4.1. DHCPv4 Client Request (e.g., DISCOVER)
+
+1.  **Client Broadcast**: A DHCP client in `ns_client_X` (connected to `br_clients`) broadcasts a DHCPDISCOVER message.
+2.  **Relay Reception**: `dhcp_pyrelay.py` (in `ns_pyrelay`), listening on `v_pyrelay_c_ns` (connected to `br_clients`), receives the broadcast.
+3.  **Relay Policy - VRF Selection**: The Python relay inspects the client's MAC address (`chaddr`).
+    *   Example: If MAC starts `00:aa:...`, it decides to target the RED VRF.
+    *   Example: If MAC starts `00:bb:...`, it decides to target the BLUE VRF.
+4.  **Relay Policy - Option 82 Info**: Based on further client MAC details (e.g., `00:aa:01:...` vs `00:aa:02:...`), the relay determines the value for Option 82 sub-options (e.g., Agent Circuit ID = "VIDEO_CIRCUIT" or "DATA_CIRCUIT").
+5.  **Relay Packet Modification**:
+    *   The relay sets the `giaddr` field in the DHCPDISCOVER packet. This `giaddr` is an IP address owned by the relay on its client-facing interface (`v_pyrelay_c_ns`) that falls within a subnet managed by the *chosen* Kea server (e.g., if RED VRF, `giaddr` might be `192.168.10.254`).
+    *   The relay increments the `hops` count.
+    *   The relay inserts the determined DHCP Option 82 with its sub-options.
+6.  **Relay Forwarding**: The Python relay unicasts the modified DHCPDISCOVER from its server-facing interface (`v_pyrelay_s_ns` on `br_dhcp_test`) to the IP address of the selected Kea DHCPv4 server (e.g., `192.168.10.1` for RED server).
+7.  **Kea Server Processing**: The target Kea server (e.g., in `ns_red`):
+    *   Receives the relayed packet. It notes the `giaddr`.
+    *   Uses the `giaddr` to identify the relevant `shared-networks` block in its configuration.
+    *   Parses DHCP Option 82 (specifically the Agent Circuit ID).
+    *   Applies its `client-classes` rules. If a class matches (e.g., `VIDEO_USERS_CLASS` for Circuit ID "VIDEO_CIRCUIT"), it selects the subnet/pool associated with that class (e.g., `192.168.10.0/24`).
+    *   Allocates an IP and prepares a DHCPOFFER.
+8.  **Kea Server Reply**: The Kea server unicasts the DHCPOFFER back to the `giaddr` (which is an IP of our Python relay).
+9.  **Relay Receives Offer**: `dhcp_pyrelay.py` receives the DHCPOFFER on its client-facing interface (where the `giaddr` IP is configured).
+10. **Relay Strips Option 82**: The relay removes the Option 82 it originally inserted.
+11. **Relay Forwards to Client**: The relay broadcasts the DHCPOFFER (now without Option 82) onto `br_clients`.
+12. **Client Receives Offer**: The original client receives the DHCPOFFER.
+13. *(The DHCPREQUEST/DHCPACK sequence follows a similar relayed path, with the relay performing similar modifications/stripping as appropriate).*
+
+### 4.2. DHCPv6 Client Request (e.g., SOLICIT)
+
+1.  **Client Multicast**: A DHCPv6 client in `ns_client_X` sends a SOLICIT message to the All\_DHCP\_Relay\_Agents\_and\_Servers multicast address (`ff02::1:2`).
+2.  **Relay Reception**: `dhcp_pyrelay.py` (in `ns_pyrelay`), having joined the multicast group on `v_pyrelay_c_ns`, receives the SOLICIT. Client source is its Link-Local Address (LLA).
+3.  **Relay Policy - VRF Selection**: The Python relay parses the client's DUID (Option 1). It extracts the MAC address if the DUID is DUID-LLT or DUID-LL.
+    *   Example: If extracted MAC starts `00:aa:...`, target RED VRF.
+    *   Example: If extracted MAC starts `00:bb:...`, target BLUE VRF.
+4.  **Relay Policy - Interface-ID Info**: Based on DUID type or further MAC details, the relay determines the value for the Interface-ID option (Option 18) (e.g., "V6\_VIDEO\_LINK" or "V6\_DATA\_LINK").
+5.  **Relay Packet Modification (Crafting Relay-Forward)**:
+    *   The relay constructs a `Relay-Forward` message.
+    *   `msg-type` = 12 (RELAY-FORW).
+    *   `hop-count` = 0 (or incremented from incoming if it was already relayed).
+    *   `link-address`: An IPv6 address of the relay on the client's link (`v_pyrelay_c_ns`) that corresponds to the target VRF (e.g., if RED VRF, `link-address` might be `fd00:red::fe`).
+    *   `peer-address`: The client's source Link-Local Address.
+    *   **Options**:
+        *   Relay Message option (Option 9): Contains the original client SOLICIT.
+        *   Interface-ID option (Option 18): Contains the determined value (e.g., "V6\_VIDEO\_LINK").
+6.  **Relay Forwarding**: The Python relay unicasts the `Relay-Forward` message from its server-facing interface (`v_pyrelay_s_ns`) to the IP address of the selected Kea DHCPv6 server (e.g., `fd00:red::1` for RED server).
+7.  **Kea Server Processing**: The target Kea server (e.g., in `ns_red`):
+    *   Receives the `Relay-Forward`.
+    *   Uses the `link-address` to identify the relevant `shared-networks` block.
+    *   Extracts the Interface-ID (Option 18) from the `Relay-Forward` message.
+    *   Applies its `client-classes` rules. If a class matches (e.g., `V6_VIDEO_USERS_CLASS` for Interface-ID "V6\_VIDEO\_LINK"), it selects the prefix/pool associated with that class (e.g., `fd00:red::/64`).
+    *   Prepares an ADVERTISE message (encapsulated later by the server in a Relay-Reply).
+8.  **Kea Server Reply (Relay-Reply)**: The Kea server sends a `Relay-Reply` message back to the source IP of the `Relay-Forward` message (the Python relay's server-facing interface IP). The `Relay-Reply` contains the client's original `peer-address` and encapsulates the server's ADVERTISE message (as Option 9).
+9.  **Relay Receives Relay-Reply**: `dhcp_pyrelay.py` receives the `Relay-Reply`.
+10. **Relay Decapsulation**: It parses the `Relay-Reply`, extracts the encapsulated ADVERTISE message and the `peer-address`.
+11. **Relay Forwards to Client**: The relay sends the decapsulated ADVERTISE message to the client's `peer-address` (LLA) on the `br_clients` segment using the correct scope ID.
+12. *(The DHCPv6 REQUEST/REPLY sequence follows a similar relayed path).*
+
+## 5. Python Relay Agent Policy Engine (Conceptual)
+
+The "bookkeeping" or policy engine within `dhcp_pyrelay.py` is central to its intelligent behavior.
+
+*   **VRF Selection**:
+    *   Input: Client MAC address (from `chaddr` for DHCPv4, or extracted from DUID for DHCPv6).
+    *   Logic: A set of rules (initially MAC prefixes `00:AA:...` -> RED, `00:BB:...` -> BLUE) maps the client to a target VRF (RED or BLUE).
+    *   Output: Selected VRF ID, target Kea server IPs for that VRF, and the `giaddr`/`link-address` to be used for that VRF.
+*   **Intra-VRF Policy (Option Value Selection)**:
+    *   Input: Client MAC address, DUID type, selected VRF.
+    *   Logic: Further rules determine the specific string value for Option 82 Circuit ID (DHCPv4) or DHCPv6 Interface-ID. This allows differentiation *within* a VRF.
+        *   Example for RED VRF: MAC `00:AA:01:...` -> "VIDEO_CIRCUIT". MAC `00:AA:02:...` -> "DATA_CIRCUIT".
+        *   Example for RED VRF (DHCPv6): DUID Type 1 -> "V6_VIDEO_LINK". DUID Type 3 -> "V6_DATA_LINK".
+    *   Output: The string value to be inserted into the respective DHCP option.
+*   **Configuration**: Initially, these policies are hardcoded in `dhcp_pyrelay.py`. For more flexibility, they could be loaded from an external configuration file (e.g., YAML or JSON) in a future iteration.
+
+This design allows the Python relay to act as a sophisticated policy enforcement point, directing traffic and influencing Kea's allocation decisions based on centrally defined rules.
+
+## 6. Project Components & Setup
+
+### 6.1. Scripts
+*   **`kea_server_setup.sh`**: Main orchestration script.
+    *   Sets up network (bridges, namespaces, veth pairs, IPs).
+    *   Generates Kea server configuration files.
+    *   Starts/stops Kea server processes.
+    *   Starts/stops the `dhcp_pyrelay.py` agent.
+    *   Provides cleanup.
+*   **`dhcp_pyrelay.py`**: The custom Python DHCPv4/v6 relay agent.
+    *   (Development in progress, current version includes argument parsing, logging, daemonization, socket setup for v4/v6, and core relaying logic with Option82/Interface-ID manipulation and VRF selection based on MAC/DUID).
+*   **`setup_kea.sh`**: Utility script to install ISC Kea 3.0.0 (including `kea-dhcp4`, `kea-dhcp6`, and `perfdhcp`) from Cloudsmith packages. This is a prerequisite if Kea is not already installed.
+*   **`dhcp_simulator.py`**: Client simulator (using `perfdhcp`) developed previously. Can be used to generate test client traffic. It creates its own client namespaces and connects them to a specified bridge (which should be `br_clients` for this setup).
+
+### 6.2. Prerequisites
+*   Linux system with root access.
+*   `iproute2` package installed.
+*   `python3` (for `dhcp_pyrelay.py` and `dhcp_simulator.py`).
+    *   Potentially `python3-scapy` if Scapy is chosen for packet manipulation in `dhcp_pyrelay.py` (current implementation uses `struct`).
+*   ISC Kea 3.0.0 binaries (`kea-dhcp4`, `kea-dhcp6`, `perfdhcp`). Use `setup_kea.sh` if needed.
+
+### 6.3. Running the Environment
+
+1.  **Initial Kea Installation (if not already done)**:
     ```bash
-    sudo ip link add name br0 type bridge
-    sudo ip link set dev br0 up
+    chmod +x setup_kea.sh
+    sudo ./setup_kea.sh
     ```
-
-2.  **Connect a physical interface to the bridge** (optional, if you want the bridge to connect to an external network):
-    Ensure your physical interface (e.g., `eth1`) is not configured with an IP address directly.
+2.  **Ensure Scripts are Executable**:
     ```bash
-    # Example: removing IP from eth1 and adding it to br0
-    # sudo ip addr flush dev eth1
-    # sudo ip link set dev eth1 master br0
-    # sudo ip addr add <your_network_ip_for_bridge>/<prefix> dev br0
+    chmod +x kea_server_setup.sh
+    chmod +x dhcp_pyrelay.py
+    chmod +x dhcp_simulator.py
     ```
-    Alternatively, if the DHCP server is running on the same host, the bridge might not need an external physical interface, but it will still need an IP in the server's subnet if the server is configured to listen on that bridge IP.
-
-    When running `dhcp_simulator.py`, you will specify this bridge interface using the `--host-iface br0` argument. The script will then automatically connect the host-side veth pairs of the simulated clients to this bridge.
-
-### 3. Configure Target DHCP Server(s)
-
-Ensure your DHCPv4 and/or DHCPv6 servers are configured to serve leases on the network segment connected to `--host-iface`.
-
-*   **Example Kea DHCPv4 Configuration Snippet (`kea-dhcp4.conf`)**:
-    ```json
-    "Dhcp4": {
-        "interfaces-config": {
-            "interfaces": [ "br0" ] // Or the interface Kea should listen on
-        },
-        "lease-database": {
-            "type": "memfile",
-            "lfc-interval": 3600
-        },
-        "subnet4": [
-            {
-                "subnet": "192.168.100.0/24",
-                "pools": [ { "pool": "192.168.100.10 - 192.168.100.200" } ],
-                "option-data": [
-                    { "name": "routers", "data": "192.168.100.1" }
-                ]
-            }
-        ]
-    }
+3.  **Start the Full Environment (Servers and Python Relay)**:
+    ```bash
+    # The PYTHON_RELAY_SCRIPT_PATH in kea_server_setup.sh should point to dhcp_pyrelay.py
+    # (e.g., ./dhcp_pyrelay.py if in the same directory)
+    sudo ./kea_server_setup.sh start -l debug # Or other log level for the Python relay
     ```
-*   Start your Kea server(s) (e.g., `sudo systemctl start isc-kea-dhcp4-server`).
+    This command will:
+    *   Create all network infrastructure.
+    *   Generate Kea server configurations.
+    *   Start Kea DHCPv4/v6 servers in `ns_red` and `ns_blue`.
+    *   Start the `dhcp_pyrelay.py` agent in `ns_pyrelay`.
+    *   Monitor logs in `/tmp/kea_rt/` for each component.
 
-## Usage
+4.  **Run Client Simulations (in a separate terminal)**:
+    Use `dhcp_simulator.py` or manual `dhclient` instances in new, temporary client namespaces connected to the `br_clients` bridge.
+    *   **Example for RED VRF, VIDEO policy (DHCPv4)**:
+        ```bash
+        sudo python3 dhcp_simulator.py \
+            --num-clients 5 \
+            --host-iface br_clients \
+            --base-mac 00:aa:01:00:00:00 \
+            --dhcpv4-server 255.255.255.255 `# Target broadcast for relay pickup` \
+            --duration 60 --rate 2 \
+            --output-dir ./sim_logs_red_video
+        ```
+    *   **Example for BLUE VRF, DATA policy (DHCPv4)**:
+        ```bash
+        sudo python3 dhcp_simulator.py \
+            --num-clients 5 \
+            --host-iface br_clients \
+            --base-mac 00:bb:02:00:00:00 \
+            --dhcpv4-server 255.255.255.255 \
+            --duration 60 --rate 2 \
+            --output-dir ./sim_logs_blue_data
+        ```
+    *   *(Similar invocations can be made for DHCPv6 by specifying `--dhcpv6-server ff02::1:2` and appropriate `--base-mac` which influences DUID generation by perfdhcp).*
 
-Run the simulator script with `sudo`:
+5.  **Monitor and Verify**:
+    *   Python Relay Logs: `/tmp/kea_rt/ns_pyrelay/pyrelay.log`
+    *   Kea Server Logs: `/tmp/kea_rt/ns_red/kea-dhcp4-server.log`, etc.
+    *   Kea Lease Files: `/tmp/kea_rt/ns_red/kea-leases4.csv`, etc.
+    *   `dhcp_simulator.py` console output and its log directory.
+    *   `tcpdump` on `br_clients`, `br_dhcp_test`, and inside namespaces for detailed packet flow.
 
-```bash
-sudo python3 dhcp_simulator.py --num-clients <N> --host-iface <interface_name> [options]
-```
+6.  **Stop and Cleanup**:
+    ```bash
+    sudo ./kea_server_setup.sh stop      # Stops Kea servers and Python relay
+    sudo ./kea_server_setup.sh cleanup   # Stops processes and removes all network setup & runtime files
+    ```
 
-### Command-Line Arguments
+## 7. Future Enhancements / Considerations
+*   **Configurable Python Relay Policy**: Load relay policies (MAC/DUID to VRF mapping, Option 82/Interface-ID values) from an external file (YAML/JSON) instead of hardcoding in `dhcp_pyrelay.py`.
+*   **Advanced Packet Manipulation**: Use a library like Scapy in `dhcp_pyrelay.py` for more complex DHCP option handling if needed.
+*   **Performance Optimization for Python Relay**: If `select`-based loop becomes a bottleneck under very high load, explore `asyncio` or multiprocessing/threading models.
+*   **DHCPv6 DUID Policy Refinement**: Allow more flexible DUID-based policies beyond just DUID type and embedded MAC.
+*   **Automated `tcpdump`**: Integrate `tcpdump` start/stop into `kea_server_setup.sh` for easier debugging.
+*   **Security**: The current setup runs processes with `sudo` and has permissive chmod on runtime directories. For any non-testing use, proper user accounts and permissions for Kea and the relay agent would be essential.
 
-*   `--num-clients N`: (int, **required**) Number of dual-stack clients to simulate.
-*   `--host-iface IFACE`: (str, **required**) Host-side network interface or bridge (e.g., `br0`) to connect clients to.
-*   `--dhcpv4-server IP`: (str, optional) IP address of the DHCPv4 server. Skips v4 simulation if not provided.
-*   `--dhcpv6-server IP_OR_ALIAS`: (str, optional) IP address of the DHCPv6 server, or 'all'/'servers' for multicast. Skips v6 simulation if not provided.
-*   `--rate R`: (int, default: 10) Target requests per second per client (for each protocol).
-*   `--duration T`: (int, default: 60) Duration of the test in seconds for each client.
-*   `--v4-template FILE`: (str, optional) Path to a custom DHCPv4 packet template file for `perfdhcp`.
-*   `--v6-template FILE`: (str, optional) Path to a custom DHCPv6 packet template file for `perfdhcp`.
-*   `--perfdhcp-path PATH`: (str, default: `/usr/sbin/perfdhcp`) Path to the `perfdhcp` executable.
-*   `--output-dir DIR`: (str, default: `perfdhcp_results`) Directory to store `perfdhcp` output logs.
-*   `--base-mac AA:BB:CC:DD:EE:00`: (str, optional) Base MAC for DHCPv4 clients. The script increments the last octet for each client.
-*   `--base-duid DUID_HEX`: (str, optional) Base DUID (hex string) for DHCPv6 clients. The script attempts to increment the last byte for uniqueness.
-
-### Example
-
-Simulate 5 dual-stack clients connecting via `br0`, targeting a local DHCPv4 server at `192.168.100.1` and any DHCPv6 server via multicast, for 30 seconds:
-
-```bash
-sudo python3 dhcp_simulator.py \
-    --num-clients 5 \
-    --host-iface br0 \
-    --dhcpv4-server 192.168.100.1 \
-    --dhcpv6-server all \
-    --duration 30 \
-    --output-dir ./client_logs
-```
-
-## Output and Logs
-
-*   The script will print status messages to the console during setup, execution, and cleanup.
-*   A summary of successful/failed simulations for DHCPv4 and DHCPv6 will be printed at the end.
-*   Detailed logs from each `perfdhcp` instance are stored in the directory specified by `--output-dir` (default: `perfdhcp_results`).
-    *   Log files are named `client_<id>_v4.log` and `client_<id>_v6.log`.
-    *   These logs contain the raw output of `perfdhcp`, including statistics on packets sent/received, lease times, etc.
-
-## Troubleshooting
-
-*   **Permissions**: Ensure the script is run with `sudo`.
-*   **`perfdhcp` not found**: Verify `perfdhcp` is installed and `--perfdhcp-path` is correct.
-*   **No DHCP Offers/Advertisements**:
-    *   Check if your DHCP server is running and configured for the correct subnet.
-    *   Verify the `--host-iface` (e.g., bridge `br0`) is correctly set up and can reach the DHCP server.
-    *   Check firewall rules on the host or DHCP server machine.
-    *   Inspect `tcpdump` or Wireshark on the `--host-iface` or on the DHCP server's interface to see if DHCP packets are flowing as expected.
-*   **Namespace/veth errors**: Errors from `ip netns` or `ip link` commands usually indicate issues with setup or cleanup. The script attempts to clean up resources, but manual cleanup might occasionally be needed if the script exits prematurely:
-    *   List namespaces: `sudo ip netns list`
-    *   Delete a namespace: `sudo ip netns del <namespace_name>`
-    *   List links: `ip link show`
-    *   Delete a veth interface: `sudo ip link del <veth_host_name>`
-
-## Running with Docker
-
-This simulator can also be run inside a Docker container. This requires building a Docker image that includes all dependencies and the simulator scripts.
-
-### 1. Build the Docker Image
-
-A `Dockerfile` is provided. To build the image, navigate to the directory containing the `Dockerfile`, `setup_kea.sh`, and `dhcp_simulator.py`, then run:
-
-```bash
-docker build -t dhcp-simulator .
-```
-This command builds an image named `dhcp-simulator`. The build process includes running `setup_kea.sh` to install Kea and `perfdhcp` inside the image.
-
-### 2. Run the Docker Container
-
-Running the simulator inside Docker requires giving the container special privileges to manage network namespaces and interfaces. The `--network=host` option is also recommended to allow the simulator to interact with host network interfaces (like a host bridge) as intended by the script's design.
-
-**Example `docker run` command:**
-
-```bash
-docker run --rm -it \
-    --cap-add=NET_ADMIN \
-    --cap-add=SYS_ADMIN \
-    --network=host \
-    -v $(pwd)/my_client_logs:/app/perfdhcp_results \
-    dhcp-simulator \
-    --num-clients 2 \
-    --host-iface br0 \
-    --dhcpv4-server 192.168.100.1 \
-    --output-dir /app/perfdhcp_results
-    # Add other dhcp_simulator.py arguments as needed
-```
-
-**Explanation of `docker run` options:**
-
-*   `--rm`: Automatically removes the container when it exits.
-*   `-it`: Runs in interactive mode with a pseudo-TTY (useful for seeing output).
-*   `--cap-add=NET_ADMIN --cap-add=SYS_ADMIN`: Grants necessary capabilities to the container to manage network interfaces and namespaces. Alternatively, `--privileged` can be used for broader permissions, but it's less secure.
-*   `--network=host`: The container shares the host's network stack. This allows `dhcp_simulator.py` (running inside the container) to directly see and manipulate host interfaces specified by `--host-iface` (e.g., a bridge `br0` on the host).
-*   `-v $(pwd)/my_client_logs:/app/perfdhcp_results`: Mounts a directory from your host (`$(pwd)/my_client_logs`) into the container at `/app/perfdhcp_results`. The simulator script saves its logs to `/app/perfdhcp_results` (if `--output-dir` is set to that, which is the default if running from `/app`), so this makes the logs persistent on your host machine.
-*   `dhcp-simulator`: The name of the Docker image built in the previous step.
-*   The arguments after the image name (`--num-clients 2 ...`) are passed directly to the `dhcp_simulator.py` script.
-    *   **Important**: If you use `-v` to mount an output directory, ensure the `--output-dir` argument passed to `dhcp_simulator.py` matches the *container-side path* of that volume mount (e.g., `/app/perfdhcp_results`).
-
-### Considerations for Docker Networking
-
-*   **`--network=host`**: This is the simplest way to allow the script to function as designed, by giving it access to the host's network interfaces. The `--host-iface` argument should then refer to an interface or bridge that exists on the Docker host (e.g., `br0` that you would have set up as per the "Prepare Host Network" section for non-Docker use).
-*   **Alternative Docker Networks**: If you avoid `--network=host`, allowing the containerized script to manage veth pairs that connect to a *host-level* bridge or interface becomes significantly more complex. It would likely involve manually creating one side of a veth pair on the host and passing the other side into the container, then instructing the script to use that passed-in interface. This level of integration is not covered by the current script's automatic setup.
-*   **Internal `sudo`**: The `dhcp_simulator.py` script uses `sudo` for `ip` commands. The Docker container runs as `root` by default, and the `Dockerfile` ensures `sudo` is available and passwordless for root, so these commands will execute correctly.
-```
+This README provides a solid overview of the current project state and future direction.
