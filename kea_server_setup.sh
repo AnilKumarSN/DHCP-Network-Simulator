@@ -163,9 +163,34 @@ generate_kea_dhcp4_config() {
     local control_socket_path="$9"
 
     log_info "Generating Kea DHCPv4 config for $ns_name at $conf_file_path..."
+
+    # Specific classification for ns_red
+    local client_classes_config=""
+    local subnet1_class_filter=""
+    local subnet2_class_filter=""
+
+    if [ "$ns_name" == "ns_red" ]; then
+        client_classes_config=$(cat << EOCC
+        "client-classes": [
+            {
+                "name": "VIDEO_USERS_CLASS",
+                "test": "relay4.circuit-id == 'VIDEO_CIRCUIT'"
+            },
+            {
+                "name": "DATA_USERS_CLASS",
+                "test": "relay4.circuit-id == 'DATA_CIRCUIT'"
+            }
+        ],
+EOCC
+)
+        subnet1_class_filter='"client-class": "VIDEO_USERS_CLASS",'
+        subnet2_class_filter='"client-class": "DATA_USERS_CLASS",'
+    fi
+
     cat << EOF > "$conf_file_path"
 {
     "Dhcp4": {
+        ${client_classes_config}
         "interfaces-config": {
             "interfaces": ["$interface_name"]
         },
@@ -190,11 +215,13 @@ generate_kea_dhcp4_config() {
                 "interface": "$interface_name",
                 "subnet4": [
                     {
+                        ${subnet1_class_filter}
                         "subnet": "$subnet1_cidr",
                         "pools": [ { "pool": "$pool1_range" } ],
                         "option-data": [ { "name": "routers", "data": "${subnet1_cidr%.*}.1" } ]
                     },
                     {
+                        ${subnet2_class_filter}
                         "subnet": "$subnet2_cidr",
                         "pools": [ { "pool": "$pool2_range" } ],
                         "option-data": [ { "name": "routers", "data": "${subnet2_cidr%.*}.1" } ]

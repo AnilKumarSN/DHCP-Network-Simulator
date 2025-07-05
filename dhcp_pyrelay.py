@@ -188,6 +188,25 @@ class DHCPRelayAgent:
         # Add a dictionary to store transaction states if needed for matching replies to requests
         self.pending_transactions = {} # xid -> client_addr_info (e.g., MAC, original source port)
 
+    # DHCP Option codes
+    DHCP_OPTION_PAD = 0
+    DHCP_OPTION_SUBNET_MASK = 1
+    DHCP_OPTION_ROUTER = 3
+    DHCP_OPTION_DNS_SERVER = 6
+    DHCP_OPTION_HOSTNAME = 12
+    DHCP_OPTION_REQUESTED_IP = 50
+    DHCP_OPTION_LEASE_TIME = 51
+    DHCP_OPTION_MESSAGE_TYPE = 53
+    DHCP_OPTION_SERVER_ID = 54
+    DHCP_OPTION_PARAM_REQUEST_LIST = 55
+    DHCP_OPTION_RELAY_AGENT_INFO = 82 # Option 82
+    DHCP_OPTION_END = 255
+
+    # Option 82 Sub-option codes
+    AGENT_CIRCUIT_ID_SUBOPTION = 1
+    AGENT_REMOTE_ID_SUBOPTION = 2
+
+
     def parse_dhcpv4_options(self, options_data):
         """Parses DHCP options (TLV format)."""
         options = {}
