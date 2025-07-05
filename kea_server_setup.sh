@@ -266,13 +266,15 @@ EOF
 # --- Python Relay Management (Placeholders) ---
 start_python_relay() {
     local ns_name="ns_pyrelay"
-    local client_if="v_pyrelay_c_ns" # Name of client-facing interface inside ns_pyrelay
-    local server_if="v_pyrelay_s_ns" # Name of server-facing interface inside ns_pyrelay
+    local client_if="v_pyrelay_c_ns"
+    local server_if="v_pyrelay_s_ns"
 
-    local red_server_v4_ip="192.168.10.1"
-    local red_server_v6_ip="fd00:red::1"
-    local blue_server_v4_ip="192.168.20.1"
-    local blue_server_v6_ip="fd00:blue::1"
+    # For Iteration 1, hardcode to relay to RED server's primary subnet
+    local target_v4_server_ip="192.168.10.1" # RED server's veth_red_ns primary IP
+    local giaddr_to_set="192.168.10.254"     # One of the IPs on v_pyrelay_c_ns, in RED's primary subnet range
+
+    # local target_v6_server_ip="fd00:red::1" # For future DHCPv6 relaying
+    # local link_addr_v6_to_set="fd00:red::fe" # For future DHCPv6 relaying
 
     local pid_file="${PYRELAY_NS_RUNTIME_DIR}/pyrelay.pid"
     local log_file="${PYRELAY_NS_RUNTIME_DIR}/pyrelay.log"
@@ -282,22 +284,17 @@ start_python_relay() {
     if [ ! -f "$PYTHON_RELAY_SCRIPT_PATH" ]; then
         log_error "Python relay script $PYTHON_RELAY_SCRIPT_PATH not found. Cannot start relay."
         log_info "Please create $PYTHON_RELAY_SCRIPT_PATH first with the relay logic."
-        # Create a dummy PID file to allow status/stop to 'succeed' for now
-        echo "dummy_relay_pid_not_started" > "$pid_file"
-        return 1 # Indicate failure or inability to start
+        echo "dummy_relay_pid_not_started" > "$pid_file" # Dummy for status
+        return 1
     fi
 
-    # Actual command to run the Python relay
-    # This will be refined once dhcp_pyrelay.py arguments are finalized
-    log_info "Executing: sudo ip netns exec $ns_name python3 $PYTHON_RELAY_SCRIPT_PATH --client-iface $client_if --server-iface $server_if --red-server-v4 $red_server_v4_ip --red-server-v6 $red_server_v6_ip --blue-server-v4 $blue_server_v4_ip --blue-server-v6 $blue_server_v6_ip --pid-file $pid_file --log-file $log_file &"
+    log_info "Executing: sudo ip netns exec $ns_name python3 $PYTHON_RELAY_SCRIPT_PATH --client-iface $client_if --server-iface $server_if --target-dhcpv4-server $target_v4_server_ip --giaddr $giaddr_to_set --pid-file $pid_file --log-file $log_file &"
 
     sudo ip netns exec "$ns_name" python3 "$PYTHON_RELAY_SCRIPT_PATH" \
         --client-iface "$client_if" \
         --server-iface "$server_if" \
-        --red-server-v4 "$red_server_v4_ip" \
-        --red-server-v6 "$red_server_v6_ip" \
-        --blue-server-v4 "$blue_server_v4_ip" \
-        --blue-server-v6 "$blue_server_v6_ip" \
+        --target-dhcpv4-server "$target_v4_server_ip" \
+        --giaddr "$giaddr_to_set" \
         --pid-file "$pid_file" \
         --log-file "$log_file" > "$log_file" 2>&1 &
 

@@ -185,43 +185,135 @@ class DHCPRelayAgent:
             sys.exit(1)
 
     # TODO: setup_sockets_v6
+        # Add a dictionary to store transaction states if needed for matching replies to requests
+        self.pending_transactions = {} # xid -> client_addr_info (e.g., MAC, original source port)
+
+    def parse_dhcpv4_options(self, options_data):
+        """Parses DHCP options (TLV format)."""
+        options = {}
+        i = 0
+        while i < len(options_data):
+            option_code = options_data[i]
+            i += 1
+            if option_code == 0:  # Pad option
+                continue
+            if option_code == 255:  # End option
+                break
+            if i >= len(options_data): # Avoid index error if length byte is missing
+                self.logger.warning("Malformed options: missing length byte.")
+                break
+            option_len = options_data[i]
+            i += 1
+            if i + option_len > len(options_data): # Avoid index error if value is shorter than length
+                self.logger.warning(f"Malformed option {option_code}: value shorter than specified length {option_len}.")
+                break
+            option_value = options_data[i:i + option_len]
+            options[option_code] = option_value
+            i += option_len
+        return options
+
+    def parse_dhcpv4_packet(self, data):
+        """Parses a DHCPv4 packet and returns a dictionary of fields."""
+        if len(data) < 240: # Minimum DHCP packet size (236 for header + 4 for magic cookie)
+            self.logger.warning(f"Packet too short to be DHCPv4: {len(data)} bytes")
+            return None
+
+        # DHCPv4 fixed header structure:
+        # op (1), htype (1), hlen (1), hops (1)
+        # xid (4)
+        # secs (2), flags (2)
+        # ciaddr (4), yiaddr (4), siaddr (4), giaddr (4)
+        # chaddr (16)
+        # sname (64)
+        # file (128)
+        # magic cookie (4) - 0x63825363
+        # options (variable)
+
+        header_format = '!BBBB I HH IIII 16s 64s 128s' # Total 236 bytes
+        # Magic cookie is 4 bytes: 0x63, 0x82, 0x53, 0x63
+        # Options follow
+
+        try:
+            op, htype, hlen, hops, \
+            xid, \
+            secs, flags, \
+            ciaddr_raw, yiaddr_raw, siaddr_raw, giaddr_raw, \
+            chaddr, sname, file_ = struct.unpack(header_format, data[:236])
+
+            magic_cookie_offset = 236
+            magic_cookie = data[magic_cookie_offset:magic_cookie_offset+4]
+            if magic_cookie != b'\x63\x82\x53\x63':
+                self.logger.warning("Invalid DHCP magic cookie.")
+                return None
+
+            options_data = data[magic_cookie_offset+4:]
+            parsed_options = self.parse_dhcpv4_options(options_data)
+
+            packet_info = {
+                'op': op, 'htype': htype, 'hlen': hlen, 'hops': hops,
+                'xid': xid,
+                'secs': secs, 'flags': flags,
+                'ciaddr': socket.inet_ntoa(ciaddr_raw),
+                'yiaddr': socket.inet_ntoa(yiaddr_raw),
+                'siaddr': socket.inet_ntoa(siaddr_raw),
+                'giaddr': socket.inet_ntoa(giaddr_raw),
+                'chaddr': chaddr[:hlen], # Only take hlen bytes for MAC
+                'sname': sname.split(b'\x00', 1)[0], # Null-terminated
+                'file': file_.split(b'\x00', 1)[0], # Null-terminated
+                'options': parsed_options
+            }
+            return packet_info
+        except struct.error as e:
+            self.logger.error(f"Error unpacking DHCPv4 packet: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Unexpected error parsing DHCPv4 packet: {e}")
+            return None
+
 
     def handle_dhcpv4_packet(self, data, addr):
         self.logger.info(f"Received DHCPv4 packet from {addr}, {len(data)} bytes.")
-        # TODO: Parse packet (struct, scapy)
-        # TODO: Implement logic: set giaddr, determine target server
-        # TODO: Forward to server self.args.red_server_v4 (hardcoded for Iteration 1)
-        # TODO: Receive reply from server
-        # TODO: Forward reply to client
 
-        # Example: hardcoded forward to RED server's primary subnet
-        # This is highly simplified. Real parsing and giaddr setting needed.
-        if self.args.red_server_v4:
-            # For now, just echo back for testing socket.
-            # In reality, modify 'data' here, especially giaddr.
-            # For Iteration 1, giaddr would be e.g. 192.168.10.254
-            # The packet options (chaddr, xid etc) also need to be correct.
-            # This is where packet crafting / modification happens.
+        parsed_packet = self.parse_dhcpv4_packet(data)
+        if not parsed_packet:
+            self.logger.warning("Failed to parse DHCPv4 packet. Dropping.")
+            return
 
-            # Placeholder: set giaddr (offset 24, 4 bytes)
-            # This requires packet to be mutable and knowing its structure.
-            # For now, assume data is just relayed as is for testing connectivity.
-            # A real relay MUST set giaddr if it's 0.
+        self.logger.debug(f"Parsed DHCPv4 packet: {parsed_packet}")
 
-            # op = data[0]
-            # if op == BOOTREQUEST:
-            #    mutable_packet = bytearray(data)
-            #    # Example: if giaddr is 0 (offset 24 for 4 bytes)
-            #    # struct.pack_into('!I', mutable_packet, 24, socket.inet_aton('192.168.10.254'))
-            #    # data = bytes(mutable_packet)
-
-            self.logger.info(f"Relaying to DHCPv4 server {self.args.red_server_v4}:{DHCP_SERVER_PORT}")
-            try:
-                self.sock_v4_server.sendto(data, (self.args.red_server_v4, DHCP_SERVER_PORT))
-            except Exception as e:
-                self.logger.error(f"Error sending to DHCPv4 server: {e}")
+        dhcp_message_type_opt = parsed_packet['options'].get(53) # Option 53: DHCP Message Type
+        if dhcp_message_type_opt:
+            # Ensure the option value is not empty before trying to unpack
+            if len(dhcp_message_type_opt) == 1:
+                dhcp_message_type = struct.unpack('!B', dhcp_message_type_opt)[0]
+                self.logger.info(f"DHCP Message Type: {dhcp_message_type}")
+            else:
+                self.logger.warning(f"Malformed DHCP Message Type (Option 53): length is {len(dhcp_message_type_opt)}, expected 1.")
+                return
         else:
-            self.logger.warning("No DHCPv4 server configured for RED VRF to relay to.")
+            self.logger.warning("DHCP Message Type (Option 53) not found in packet.")
+            return
+
+
+        # For Iteration 1, we primarily care about DISCOVER to relay to server
+        if parsed_packet['op'] == BOOTREQUEST and dhcp_message_type == DHCPDISCOVER:
+            self.logger.info(f"Processing DHCPDISCOVER from chaddr: {parsed_packet['chaddr'].hex()}")
+
+            modified_data = self.modify_discover_for_server(data, self.args.giaddr, parsed_packet['hops'])
+            if not modified_data:
+                self.logger.error("Failed to modify DHCPDISCOVER packet.")
+                return
+
+            if self.args.target_dhcpv4_server:
+                self.logger.info(f"Relaying modified DHCPDISCOVER to server {self.args.target_dhcpv4_server}:{DHCP_SERVER_PORT} (giaddr: {self.args.giaddr})")
+                try:
+                    self.sock_v4_server.sendto(modified_data, (self.args.target_dhcpv4_server, DHCP_SERVER_PORT))
+                except Exception as e:
+                    self.logger.error(f"Error sending to DHCPv4 server: {e}")
+            else:
+                self.logger.warning("No target DHCPv4 server configured to relay to.")
+        else:
+            self.logger.info(f"Ignoring non-DISCOVER DHCPv4 packet (type: {dhcp_message_type}, op: {parsed_packet['op']}).")
 
 
     def run(self):
@@ -277,15 +369,15 @@ def main():
     parser.add_argument('--client-iface', required=True, help="Client-facing network interface name (e.g., v_pyrelay_c_ns).")
     parser.add_argument('--server-iface', required=True, help="Server-facing network interface name (e.g., v_pyrelay_s_ns).")
 
-    # For Iteration 1, we might hardcode target servers or simplify.
-    # These are the IPs of the Kea servers in their respective namespaces.
-    parser.add_argument('--red-server-v4', help="IP address of the RED Kea DHCPv4 server.")
-    parser.add_argument('--red-server-v6', help="IP address of the RED Kea DHCPv6 server.")
-    parser.add_argument('--blue-server-v4', help="IP address of the BLUE Kea DHCPv4 server.")
-    parser.add_argument('--blue-server-v6', help="IP address of the BLUE Kea DHCPv6 server.")
+    # For Iteration 1, focusing on DHCPv4 and a single target server & giaddr
+    parser.add_argument('--target-dhcpv4-server', required=True, help="IP address of the target Kea DHCPv4 server.")
+    parser.add_argument('--giaddr', required=True, help="Gateway IP Address (giaddr) to set in relayed DHCPv4 packets.")
+    # DHCPv6 arguments will be added in later iterations
+    # parser.add_argument('--target-dhcpv6-server', help="IP address of the target Kea DHCPv6 server.")
+    # parser.add_argument('--link-address-v6', help="IPv6 Link Address to use in Relay-Forward messages.")
 
     parser.add_argument('--pid-file', required=True, help="Path to PID file.")
-    parser.add_argument('--log-file', help="Path to log file. If not specified, logs to stdout.")
+    parser.add_argument('--log-file', help="Path to log file. If not specified, logs to stdout/stderr based on foreground mode.")
     parser.add_argument('--log-level', default='info', choices=LOG_LEVELS.keys(), help="Logging level.")
     parser.add_argument('-f', '--foreground', action='store_true', help="Run in foreground (do not daemonize).")
 
