@@ -186,10 +186,14 @@ class DHCPRelayAgent:
             self.sock_v4_client=socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP); self.sock_v4_client.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); self.sock_v4_client.setsockopt(socket.SOL_SOCKET,socket.SO_BROADCAST,1); self.sock_v4_client.bind(('',DHCP_CLIENT_PORT)); self.logger.info(f"DHCPv4 client listening socket bound to port {DHCP_CLIENT_PORT}")
             self.sock_v4_server=socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP); self.sock_v4_server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); self.logger.info("DHCPv4 server communication socket created.")
             return True
-        except OSError as e: self.logger.error(f"Error setting up DHCPv4 sockets: {e}");_close_socket(self.sock_v4_client);self.sock_v4_client=None; return False
+        except OSError as e: self.logger.error(f"Error setting up DHCPv4 sockets: {e}"); self.sock_v4_client=None; return False
 
     def setup_sockets_v6(self):
-        if not self.args.target_dhcpv6_server or not self.args.link_address_v6: self.logger.info("DHCPv6 target server or link-address not configured. Skipping."); return False
+        is_any_v6_server_configured = self.args.red_server_v6 or self.args.blue_server_v6
+        if not is_any_v6_server_configured:
+            self.logger.info("No DHCPv6 servers (RED or BLUE) configured. Skipping DHCPv6 socket setup.")
+            return False
+
         self.logger.info("Setting up DHCPv6 sockets...")
         try:
             self.sock_v6_client=socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP); self.sock_v6_client.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
@@ -202,7 +206,11 @@ class DHCPRelayAgent:
             else: self.logger.warning(f"Could not get iface index for {self.args.client_iface}. MCast group NOT joined.")
             self.sock_v6_server=socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP); self.sock_v6_server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); self.logger.info("DHCPv6 server comms socket created.")
             return True
-        except OSError as e: self.logger.error(f"Error setting up DHCPv6 sockets: {e}"); _close_socket(self.sock_v6_client); self.sock_v6_client=None; _close_socket(self.sock_v6_server); self.sock_v6_server=None; return False
+        except OSError as e:
+            self.logger.error(f"Error setting up DHCPv6 sockets: {e}")
+            if self.sock_v6_client: self.sock_v6_client.close(); self.sock_v6_client = None
+            if self.sock_v6_server: self.sock_v6_server.close(); self.sock_v6_server = None
+            return False
 
     def parse_dhcpv4_options(self, options_data):
         opts={}; i=0
@@ -229,6 +237,19 @@ class DHCPRelayAgent:
                     'chaddr':ch[:hl],'sname':sn.split(b'\0',1)[0],'file':fn.split(b'\0',1)[0],
                     'options':options,'raw_options':data[240:]}
         except Exception as e: self.logger.error(f"Err unpack/parse V4:{e}"); return None
+
+    def _get_mac_from_duid(self, duid_bytes):
+        if not duid_bytes or len(duid_bytes) < 4: # Min DUID-LL/DUID-LLT header is 4 bytes
+            return None
+        duid_type = struct.unpack('!H', duid_bytes[:2])[0]
+        hw_type = struct.unpack('!H', duid_bytes[2:4])[0]
+
+        if hw_type == 1: # Ethernet
+            if duid_type == 1 and len(duid_bytes) >= 14: # DUID-LLT (2 type + 2 hwtype + 4 time + 6 MAC)
+                return duid_bytes[8:14]
+            elif duid_type == 3 and len(duid_bytes) >= 8: # DUID-LL (2 type + 2 hwtype + 6 MAC)
+                return duid_bytes[4:10]
+        return None
 
     def parse_dhcpv6_packet(self, data_bytes, from_server=False):
         if not data_bytes or len(data_bytes)<1: self.logger.warning("Empty/short V6 pkt."); return None
@@ -273,25 +294,23 @@ class DHCPRelayAgent:
         self.logger.debug(f"Crafted RelayFwd: hdr_len {len(hdr)}, opts_len {len(opts)}")
         return bytes(hdr)+bytes(opts)
 
-    def add_option82(self, opts_data, circuit_id, remote_id=None): # Simplified from previous
+    def add_option82(self, opts_data, circuit_id, remote_id=None):
         opts=bytearray(opts_data); payload=bytearray()
         if circuit_id: cid_b=circuit_id.encode('ascii'); payload.extend([self.AGENT_CIRCUIT_ID_SUBOPTION,len(cid_b)]); payload.extend(cid_b)
         if remote_id:  rid_b=remote_id.encode('ascii');  payload.extend([self.AGENT_REMOTE_ID_SUBOPTION,len(rid_b)]);  payload.extend(rid_b)
-        if not payload: return bytes(opts_data) # No changes if no sub-options
+        if not payload: return bytes(opts_data)
 
-        # Find where to insert: before END or PADs then END
         end_idx = -1
         try: end_idx = opts.rindex(self.DHCP_OPTION_END)
-        except ValueError: pass # No END option
+        except ValueError: pass
 
         insert_pos = end_idx
         if end_idx != -1:
-            # Check for PADs before END
             temp_pos = end_idx -1
             while temp_pos >= 0 and opts[temp_pos] == self.DHCP_OPTION_PAD:
                 insert_pos = temp_pos
                 temp_pos -=1
-        else: # No END option found, append to current options
+        else:
             insert_pos = len(opts)
 
         final_opts = opts[:insert_pos]
@@ -301,26 +320,28 @@ class DHCPRelayAgent:
         self.logger.debug(f"Added Opt82. New opts len: {len(final_opts)}")
         return bytes(final_opts)
 
-    def strip_option82(self, options_data): # Simplified
+    def strip_option82(self, options_data):
         new_opts=bytearray(); i=0; orig_opts=bytes(options_data)
         while i<len(orig_opts):
             code=orig_opts[i]
             if code==self.DHCP_OPTION_END: new_opts.append(code); break
             if code==self.DHCP_OPTION_PAD: new_opts.append(code); i+=1; continue
-            if i+1>=len(orig_opts): break # Malformed
+            if i+1>=len(orig_opts): break
             length=orig_opts[i+1]
+            if i + 2 + length > len(orig_opts): self.logger.warning(f"Opt {code}: value shorter than actual len {length}."); break
+
             if code!=self.DHCP_OPTION_RELAY_AGENT_INFO: new_opts.extend(orig_opts[i:i+2+length])
             else: self.logger.info("Stripped Opt82")
             i+=(2+length)
         if not new_opts or new_opts[-1]!=self.DHCP_OPTION_END: new_opts.append(self.DHCP_OPTION_END)
         return bytes(new_opts)
 
-    def modify_discover_for_server(self, pkt_data, giaddr_str, hops): # Renamed for clarity
+    def _modify_client_packet_for_server(self, pkt_data, giaddr_str, hops): # Renamed
         if len(pkt_data)<236: self.logger.error("Pkt too short to mod"); return None
         mod_pkt=bytearray(pkt_data)
         try:
-            struct.pack_into('!4s',mod_pkt,24,socket.inet_aton(giaddr_str)) # giaddr
-            mod_pkt[3]=(hops+1)%256 # hops
+            struct.pack_into('!4s',mod_pkt,24,socket.inet_aton(giaddr_str))
+            mod_pkt[3]=(hops+1)%256
             self.logger.debug(f"giaddr={giaddr_str}, hops={mod_pkt[3]}")
             return bytes(mod_pkt)
         except Exception as e: self.logger.error(f"Err mod V4 for srv: {e}"); return None
@@ -336,28 +357,54 @@ class DHCPRelayAgent:
         self.logger.info(f"Cli V4 MsgType: {msg_type}")
 
         if parsed['op']==BOOTREQUEST and msg_type in [DHCPDISCOVER, DHCPREQUEST]:
-            self.logger.info(f"Proc V4 {('DISC' if msg_type==DHCPDISCOVER else 'REQ')} from MAC: {parsed['chaddr'].hex()}")
-            self.pending_transactions_v4[parsed['xid']]={'chaddr':parsed['chaddr'],'client_addr':client_addr,'ts':time.time()}
+            mac_str = parsed['chaddr'].hex(':')
+            self.logger.info(f"Proc V4 {('DISC' if msg_type==DHCPDISCOVER else 'REQ')} from MAC: {mac_str}")
 
-            cid=None; mac_str=parsed['chaddr'].hex(':')
-            if mac_str.startswith("00:aa:01"): cid="VIDEO_CIRCUIT"
-            elif mac_str.startswith("00:aa:02"): cid="DATA_CIRCUIT"
+            target_server_ip = None
+            giaddr_to_use = None
+            target_vrf = None
+
+            if mac_str.startswith("00:aa"):
+                target_vrf = "RED"
+                target_server_ip = self.args.red_server_v4
+                giaddr_to_use = self.args.red_giaddr
+            elif mac_str.startswith("00:bb"):
+                target_vrf = "BLUE"
+                target_server_ip = self.args.blue_server_v4
+                giaddr_to_use = self.args.blue_giaddr
+            else:
+                self.logger.warning(f"MAC {mac_str} not mapped to any VRF. Dropping V4 packet.")
+                return
+
+            if not target_server_ip or not giaddr_to_use:
+                self.logger.warning(f"Target server IP or giaddr not configured for VRF {target_vrf}. Dropping V4 packet.")
+                return
+
+            self.pending_transactions_v4[parsed['xid']]={'chaddr':parsed['chaddr'],'client_addr':client_addr,'ts':time.time(), 'vrf': target_vrf}
+            self.logger.debug(f"Stored v4 transaction {parsed['xid']} for chaddr {mac_str} -> VRF {target_vrf}")
+
+            circuit_id_to_add=None
+            if target_vrf == "RED":
+                if mac_str.startswith("00:aa:01"): circuit_id_to_add="VIDEO_CIRCUIT"
+                elif mac_str.startswith("00:aa:02"): circuit_id_to_add="DATA_CIRCUIT"
+            elif target_vrf == "BLUE":
+                if mac_str.startswith("00:bb:01"): circuit_id_to_add="VIDEO_CIRCUIT"
+                elif mac_str.startswith("00:bb:02"): circuit_id_to_add="DATA_CIRCUIT"
 
             hdr_magic=data[:240]; opts_part=parsed['raw_options']
-            if cid: self.logger.info(f"Policy: Add Opt82 CID={cid}"); opts_part=self.add_option82(opts_part,cid)
+            if circuit_id_to_add: self.logger.info(f"Policy: Add Opt82 CID={circuit_id_to_add} for VRF {target_vrf}"); opts_part=self.add_option82(opts_part,circuit_id_to_add)
 
             pkt_opt82=hdr_magic+opts_part
-            mod_data=self.modify_discover_for_server(pkt_opt82,self.args.giaddr,parsed['hops'])
+            mod_data=self._modify_client_packet_for_server(pkt_opt82, giaddr_to_use, parsed['hops'])
 
-            if not mod_data: self.logger.error("Fail mod V4 for srv");_del_pending_v4(parsed['xid']); return
-            if self.args.target_dhcpv4_server:
-                self.logger.info(f"Relay V4 to srv {self.args.target_dhcpv4_server} (giaddr:{self.args.giaddr})")
-                try: self.sock_v4_server.sendto(mod_data,(self.args.target_dhcpv4_server,DHCP_SERVER_PORT))
-                except Exception as e: self.logger.error(f"Err send V4 to srv:{e}"); _del_pending_v4(parsed['xid'])
-            else: self.logger.warning("No target V4 srv"); _del_pending_v4(parsed['xid'])
+            if not mod_data: self.logger.error("Fail mod V4 for srv");self._del_pending_v4(parsed['xid']); return
+
+            self.logger.info(f"Relay V4 to srv {target_server_ip} (giaddr:{giaddr_to_use}) for VRF {target_vrf}")
+            try: self.sock_v4_server.sendto(mod_data,(target_server_ip,DHCP_SERVER_PORT))
+            except Exception as e: self.logger.error(f"Err send V4 to srv:{e}"); self._del_pending_v4(parsed['xid'])
         else: self.logger.info(f"Ignore V4 (type:{msg_type},op:{parsed['op']})")
 
-    def _del_pending_v4(self, xid): # Helper
+    def _del_pending_v4(self, xid):
         if xid in self.pending_transactions_v4: del self.pending_transactions_v4[xid]
 
     def handle_dhcpv4_from_server(self, data, server_addr):
@@ -383,7 +430,7 @@ class DHCPRelayAgent:
             if msg_type==DHCPACK: self._del_pending_v4(parsed['xid']); self.logger.debug(f"V4 Trans {parsed['xid']} done.")
         else: self.logger.info(f"Ignore other V4 from srv (type:{msg_type},op:{parsed['op']})")
 
-    def handle_dhcpv6_from_client(self, data, client_addr_info): # client_addr_info is (ip, port, flowinfo, scopeid)
+    def handle_dhcpv6_from_client(self, data, client_addr_info):
         self.logger.info(f"Rcvd DHCPv6 from {client_addr_info[0]}%{client_addr_info[3]} p:{client_addr_info[1]}, {len(data)}B")
         parsed_msg = self.parse_dhcpv6_packet(data, from_server=False)
         if not parsed_msg: self.logger.warning("Fail parse V6 cli msg"); return
@@ -393,35 +440,60 @@ class DHCPRelayAgent:
         tid = parsed_msg.get('transaction_id')
 
         if msg_type in [DHCPV6_SOLICIT, DHCPV6_REQUEST, DHCPV6_RENEW, DHCPV6_REBIND, DHCPV6_CONFIRM, DHCPV6_INFORMATION_REQUEST, DHCPV6_RELEASE, DHCPV6_DECLINE] and tid:
-            self.logger.info(f"Proc V6 MsgType {msg_type} from DUID:{parsed_msg.get('client_duid',b'N/A').hex()} TID:{tid.hex()}")
-            self.pending_transactions_v6[tid] = {'client_addr_info': client_addr_info, 'ts': time.time()}
+            client_duid_bytes = parsed_msg.get('client_duid')
+            self.logger.info(f"Proc V6 MsgType {msg_type} from DUID:{client_duid_bytes.hex() if client_duid_bytes else 'N/A'} TID:{tid.hex()}")
 
-            iface_id_str=None; duid=parsed_msg.get('client_duid')
-            if duid and len(duid)>=2:
-                duid_type=struct.unpack('!H',duid[:2])[0]
-                if duid_type==1: iface_id_str="V6_VIDEO_LINK" # DUID-LLT
-                elif duid_type==3: iface_id_str="V6_DATA_LINK" # DUID-LL
+            target_server_ip_v6 = None
+            link_address_to_use = None
+            target_vrf = None
+            client_mac_bytes = self._get_mac_from_duid(client_duid_bytes)
+
+            if client_mac_bytes:
+                mac_str = client_mac_bytes.hex(':')
+                if mac_str.startswith("00:aa"):
+                    target_vrf = "RED"
+                    target_server_ip_v6 = self.args.red_server_v6
+                    link_address_to_use = self.args.red_link_address_v6
+                elif mac_str.startswith("00:bb"):
+                    target_vrf = "BLUE"
+                    target_server_ip_v6 = self.args.blue_server_v6
+                    link_address_to_use = self.args.blue_link_address_v6
+
+            if not target_vrf: # No MAC match or DUID not MAC-based
+                self.logger.warning(f"Client DUID {client_duid_bytes.hex() if client_duid_bytes else 'N/A'} not mapped to any VRF. Dropping V6 packet.")
+                return
+
+            if not target_server_ip_v6 or not link_address_to_use:
+                self.logger.warning(f"Target V6 server IP or link-address not configured for VRF {target_vrf}. Dropping V6 packet.")
+                return
+
+            self.pending_transactions_v6[tid] = {'client_addr_info': client_addr_info, 'ts': time.time(), 'vrf': target_vrf}
+            self.logger.debug(f"Stored v6 transaction {tid.hex()} for DUID {client_duid_bytes.hex() if client_duid_bytes else 'N/A'} -> VRF {target_vrf}")
+
+            iface_id_str=None
+            if client_mac_bytes: # Use MAC for sub-policy if available
+                mac_policy_part = client_mac_bytes.hex(':')[6:8] # 00:aa:XX - get the XX part
+                if mac_policy_part == "01": iface_id_str="V6_VIDEO_LINK"
+                elif mac_policy_part == "02": iface_id_str="V6_DATA_LINK"
+            elif client_duid_bytes: # Fallback to DUID type if MAC not usable for sub-policy
+                 duid_type=struct.unpack('!H',client_duid_bytes[:2])[0]
+                 if duid_type==1: iface_id_str="V6_VIDEO_LINK"
+                 elif duid_type==3: iface_id_str="V6_DATA_LINK"
 
             relay_opts_bytes = self._craft_interface_id_option(iface_id_str) if iface_id_str else b''
-            if iface_id_str: self.logger.info(f"Policy: Add V6 IfaceID={iface_id_str}")
+            if iface_id_str: self.logger.info(f"Policy: Add V6 IfaceID={iface_id_str} for VRF {target_vrf}")
 
-            # Relay-Forward construction
-            # hop_count is 0 for the first relay.
-            # link_address is an address of the relay on the link the client is on.
-            # peer_address is the client's source address (usually link-local).
             relay_fwd_msg = self.craft_relay_forward_message(
-                data, 0, self.args.link_address_v6, client_addr_info[0], relay_opts_bytes
+                data, 0, link_address_to_use, client_addr_info[0], relay_opts_bytes
             )
-            if not relay_fwd_msg: self.logger.error("Fail craft V6 RelayFwd"); _del_pending_v6(tid); return
+            if not relay_fwd_msg: self.logger.error("Fail craft V6 RelayFwd"); self._del_pending_v6(tid); return
 
-            if self.args.target_dhcpv6_server:
-                self.logger.info(f"Relay V6 to srv {self.args.target_dhcpv6_server}")
-                try: self.sock_v6_server.sendto(relay_fwd_msg, (self.args.target_dhcpv6_server, DHCPV6_SERVER_PORT))
-                except Exception as e: self.logger.error(f"Err send V6 RelayFwd:{e}"); _del_pending_v6(tid)
-            else: self.logger.warning("No target V6 srv"); _del_pending_v6(tid)
+            self.logger.info(f"Relay V6 to srv {target_server_ip_v6} for VRF {target_vrf}")
+            try: self.sock_v6_server.sendto(relay_fwd_msg, (target_server_ip_v6, DHCPV6_SERVER_PORT))
+            except Exception as e: self.logger.error(f"Err send V6 RelayFwd:{e}"); self._del_pending_v6(tid)
         else: self.logger.info(f"Ignore V6 cli msg type {msg_type} or no TID.")
 
-    def _del_pending_v6(self, tid_bytes): # Helper
+    def _del_pending_v6(self, tid_bytes):
         if tid_bytes in self.pending_transactions_v6: del self.pending_transactions_v6[tid_bytes]
 
     def handle_dhcpv6_from_server(self, data, server_addr_info):
@@ -435,22 +507,19 @@ class DHCPRelayAgent:
             peer_addr_str = parsed_msg.get('peer_address')
             if not enc_msg or not peer_addr_str: self.logger.warning("RELAY_REPL missing enc_msg/peer_addr"); return
 
-            # Extract original client's transaction ID from encapsulated message
             if len(enc_msg) < 4: self.logger.warning("Encapsulated msg too short"); return
             client_tid_bytes = enc_msg[1:4]
 
             trans_info = self.pending_transactions_v6.get(client_tid_bytes)
             if not trans_info: self.logger.warning(f"Rcvd RELAY_REPL for unknown cli_tid {client_tid_bytes.hex()}"); return
 
-            # peer_address in Relay-Reply is client's LL. Send encapsulated msg to client's original source port & scope.
-            # client_addr_info was (ip, port, flowinfo, scopeid)
             dest_addr_info = (peer_addr_str, DHCPV6_CLIENT_PORT, 0, trans_info['client_addr_info'][3])
             self.logger.info(f"Relay encap V6 msg to cli {dest_addr_info[0]}%{dest_addr_info[3]}:{dest_addr_info[1]}")
             try: self.sock_v6_client.sendto(enc_msg, dest_addr_info)
             except Exception as e: self.logger.error(f"Err relay V6 encap to cli: {e}")
 
             enc_msg_type = enc_msg[0]
-            if enc_msg_type == DHCPV6_REPLY: # Consider transaction complete on REPLY
+            if enc_msg_type == DHCPV6_REPLY:
                 self._del_pending_v6(client_tid_bytes)
                 self.logger.debug(f"V6 Trans {client_tid_bytes.hex()} (REPLY) done.")
         else: self.logger.info(f"Ignoring other V6 from srv (type:{parsed_msg['msg_type']})")
@@ -516,11 +585,17 @@ def main():
     parser.add_argument('--client-iface', required=True, help="Client-facing network interface name (e.g., v_pyrelay_c_ns).")
     parser.add_argument('--server-iface', required=True, help="Server-facing network interface name (e.g., v_pyrelay_s_ns).")
 
-    parser.add_argument('--target-dhcpv4-server', required=True, help="IP address of the target Kea DHCPv4 server.")
-    parser.add_argument('--giaddr', required=True, help="Gateway IP Address (giaddr) to set in relayed DHCPv4 packets.")
+    # Arguments for RED VRF/Namespace
+    parser.add_argument('--red-server-v4', help="IP of RED Kea DHCPv4 server.")
+    parser.add_argument('--red-giaddr', help="giaddr for relaying to RED DHCPv4 subnets.")
+    parser.add_argument('--red-server-v6', help="IP of RED Kea DHCPv6 server.")
+    parser.add_argument('--red-link-address-v6', help="Link-address for relaying to RED DHCPv6 prefixes.")
 
-    parser.add_argument('--target-dhcpv6-server', help="IP address of the target Kea DHCPv6 server (e.g., fd00:red::1).")
-    parser.add_argument('--link-address-v6', help="IPv6 Link Address for Relay-Forward (e.g., fd00:red::fe, an IP on client-facing iface).")
+    # Arguments for BLUE VRF/Namespace
+    parser.add_argument('--blue-server-v4', help="IP of BLUE Kea DHCPv4 server.")
+    parser.add_argument('--blue-giaddr', help="giaddr for relaying to BLUE DHCPv4 subnets.")
+    parser.add_argument('--blue-server-v6', help="IP of BLUE Kea DHCPv6 server.")
+    parser.add_argument('--blue-link-address-v6', help="Link-address for relaying to BLUE DHCPv6 prefixes.")
 
     parser.add_argument('--pid-file', required=True, help="Path to PID file.")
     parser.add_argument('--log-file', help="Path to log file. If not specified, logs to stdout/stderr based on foreground mode.")
@@ -528,6 +603,17 @@ def main():
     parser.add_argument('-f', '--foreground', action='store_true', help="Run in foreground (do not daemonize).")
 
     args = parser.parse_args()
+
+    # Basic validation for server configs if provided
+    if (args.red_server_v4 and not args.red_giaddr) or \
+       (args.red_server_v6 and not args.red_link_address_v6) or \
+       (args.blue_server_v4 and not args.blue_giaddr) or \
+       (args.blue_server_v6 and not args.blue_link_address_v6):
+        parser.error("If a server IP (v4 or v6) for RED/BLUE is provided, its corresponding giaddr/link-address must also be provided.")
+    if not (args.red_server_v4 or args.red_server_v6 or args.blue_server_v4 or args.blue_server_v6):
+        parser.error("At least one server (RED or BLUE, v4 or v6) must be configured.")
+
+
     relay_agent = DHCPRelayAgent(args)
     try: relay_agent.run()
     except KeyboardInterrupt: print("Ctrl+C received, shutting down relay agent..."); relay_agent.running = False

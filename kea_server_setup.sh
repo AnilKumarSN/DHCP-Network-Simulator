@@ -322,12 +322,21 @@ start_python_relay() {
     local client_if="v_pyrelay_c_ns"
     local server_if="v_pyrelay_s_ns"
 
-    # For Iteration 1, hardcode to relay to RED server's primary subnet
-    local target_v4_server_ip="192.168.10.1" # RED server's veth_red_ns primary IP
-    local giaddr_to_set="192.168.10.254"     # One of the IPs on v_pyrelay_c_ns, in RED's primary subnet range
+    local ns_name="ns_pyrelay"
+    local client_if="v_pyrelay_c_ns"
+    local server_if="v_pyrelay_s_ns"
 
-    # local target_v6_server_ip="fd00:red::1" # For future DHCPv6 relaying
-    # local link_addr_v6_to_set="fd00:red::fe" # For future DHCPv6 relaying
+    # RED Server Details
+    local red_server_v4_ip="192.168.10.1"
+    local red_giaddr="192.168.10.254"
+    local red_server_v6_ip="fd00:red::1"
+    local red_link_address_v6="fd00:red::fe"
+
+    # BLUE Server Details
+    local blue_server_v4_ip="192.168.20.1"
+    local blue_giaddr="192.168.20.254"
+    local blue_server_v6_ip="fd00:blue::1"
+    local blue_link_address_v6="fd00:blue::fe"
 
     local pid_file="${PYRELAY_NS_RUNTIME_DIR}/pyrelay.pid"
     local log_file="${PYRELAY_NS_RUNTIME_DIR}/pyrelay.log"
@@ -341,15 +350,25 @@ start_python_relay() {
         return 1
     fi
 
-    log_info "Executing: sudo ip netns exec $ns_name python3 $PYTHON_RELAY_SCRIPT_PATH --client-iface $client_if --server-iface $server_if --target-dhcpv4-server $target_v4_server_ip --giaddr $giaddr_to_set --pid-file $pid_file --log-file $log_file &"
+    local relay_args=(
+        --client-iface "$client_if"
+        --server-iface "$server_if"
+        --red-server-v4 "$red_server_v4_ip"
+        --red-giaddr "$red_giaddr"
+        --red-server-v6 "$red_server_v6_ip"
+        --red-link-address-v6 "$red_link_address_v6"
+        --blue-server-v4 "$blue_server_v4_ip"
+        --blue-giaddr "$blue_giaddr"
+        --blue-server-v6 "$blue_server_v6_ip"
+        --blue-link-address-v6 "$blue_link_address_v6"
+        --pid-file "$pid_file"
+        --log-file "$log_file"
+        # Add --log-level or -f for foreground from script args if needed
+    )
 
-    sudo ip netns exec "$ns_name" python3 "$PYTHON_RELAY_SCRIPT_PATH" \
-        --client-iface "$client_if" \
-        --server-iface "$server_if" \
-        --target-dhcpv4-server "$target_v4_server_ip" \
-        --giaddr "$giaddr_to_set" \
-        --pid-file "$pid_file" \
-        --log-file "$log_file" > "$log_file" 2>&1 &
+    log_info "Executing: sudo ip netns exec $ns_name python3 $PYTHON_RELAY_SCRIPT_PATH ${relay_args[*]} &"
+
+    sudo ip netns exec "$ns_name" python3 "$PYTHON_RELAY_SCRIPT_PATH" "${relay_args[@]}" > "$log_file" 2>&1 &
 
     # We are backgrounding the `ip netns exec python3 ...` command.
     # The Python script itself should handle creating its own PID file specified by --pid-file.
