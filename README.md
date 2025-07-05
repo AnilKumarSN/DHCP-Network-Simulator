@@ -1,163 +1,196 @@
-### `README.md`
+# Dual Stack DHCP Client Simulator
 
-# DHCP Network Simulator
+This script simulates multiple dual-stack (DHCPv4 and DHCPv6) clients, each operating within its own network namespace. It uses ISC Kea's `perfdhcp` tool to generate DHCP traffic. This is useful for testing DHCP server performance and functionality at scale.
 
-This project is a high-performance, C-based tool for creating complex virtual network topologies to test and validate production-grade DHCP servers like ISC Kea. It moves beyond simple shell scripts by using programmatic, low-level Linux networking APIs to simulate hundreds of concurrent DHCP clients across multiple, isolated network namespaces.
+## Features
 
-The primary goal of this simulator is to test a DHCP server's ability to perform **client classification** in a **multi-subnet, shared-link environment**. It programmatically creates two isolated networks (`red` and `blue`), starts dedicated Kea servers within them, and then simulates unique DHCP clients to verify that they receive IP addresses from the correct, pre-defined pools based on their Vendor Class Identifier (VCI).
+*   Simulates a configurable number of DHCP clients.
+*   Each client operates in an isolated network namespace.
+*   Supports both DHCPv4 and DHCPv6 traffic generation via `perfdhcp`.
+*   Customizable rate, duration, and packet templates for `perfdhcp`.
+*   Logs output from each `perfdhcp` instance to separate files.
+*   Automatic setup and cleanup of network namespaces and virtual Ethernet (veth) interfaces.
 
----
+## Prerequisites
 
-## Key Features
+1.  **Linux System**: Required for network namespace and `iproute2` functionalities.
+2.  **Python 3**: The simulator script is written in Python 3.
+3.  **`iproute2`**: The `ip` command is used extensively for network configuration. Install it if not present (e.g., `sudo apt install iproute2`).
+4.  **ISC Kea `perfdhcp`**: The `perfdhcp` executable must be installed and accessible.
+    *   The provided `setup_kea.sh` script can be used to install Kea 3.0.0, including `perfdhcp` (typically installed to `/usr/sbin/perfdhcp`). Ensure this script is run first if Kea is not already installed.
+5.  **Root Privileges**: The script `dhcp_simulator.py` must be run as root (or with `sudo`) because it creates network namespaces and manipulates network interfaces.
+6.  **Target DHCP Server(s)**: You need one or more DHCP servers (v4 and/or v6) configured and reachable on the network segment where the simulated clients will appear.
 
--   **Robust Programmatic Networking:** Uses a sequence of validated `iproute2` commands driven by C to reliably create and tear down network namespaces and `veth` pairs.
--   **Concurrent Client Simulation:** Implements a high-performance, `epoll`-based event loop to simulate a large number of DHCPv4 and DHCPv6 clients concurrently without the overhead of multi-threading.
--   **Link-Layer Packet Crafting:** Builds DHCPv4 packets from the ground up using `AF_PACKET` raw sockets and a **BPF filter**, providing total control over the Ethernet frame and preventing kernel interference.
--   **Correct DHCPv6 UDP Sockets:** Correctly uses `AF_INET6` UDP datagram sockets for DHCPv6, which is required to properly handle unicast replies from the server and avoid `ICMP Port Unreachable` errors.
--   **Advanced DHCP Testing:** The Kea configurations are specifically designed to test `shared-networks`, allowing a single server interface to serve clients for multiple IP subnets based on their VCI.
--   **Integrated Packet Capture:** Automatically runs `tcpdump` on the virtual interfaces during the simulation and saves the results to `.pcap` files for deep analysis with tools like Wireshark or `tshark`.
--   **Scalability-Ready:** The code includes client-side throttling (staggered start) and the build script tunes kernel parameters to handle a high volume of simultaneous lease requests, making it suitable for stress testing.
+## Setup
 
----
+### 1. Install Kea and `perfdhcp`
 
-## Architecture Deep Dive
+If you don't have Kea 3.0.0 and `perfdhcp` installed, use the `setup_kea.sh` script:
 
-The simulator creates a virtual network topology that isolates two distinct test environments, `red` and `blue`, from each other and from the host machine's primary network.
-
-### Network Topology
-
-The following diagram illustrates the architecture created by the simulator:
-
+```bash
+chmod +x setup_kea.sh
+sudo ./setup_kea.sh
 ```
-+-------------------------------------------------------------+
-|                     Host Machine (Root Namespace)           |
-|                                                             |
-|   +--------------------------+                              |
-|   |   ./netns_sim (Client    |                              |
-|   |      Simulator &         |                              |
-|   |      Orchestrator)       |                              |
-|   +--------------------------+                              |
-|      |                |                                     |
-|      | (veth-r-red)   | (veth-r-blue)                       |
-+------|----------------|-------------------------------------+
-       |                |
- (Virtual Cable)       (Virtual Cable)
-       |                |
-+------|----------------|-------------------------------------+
-|      | (veth-ns-red)  | (veth-ns-blue)                      |
-|      |                |                                     |
-| +------------------+  |  +------------------+               |
-| | Kea DHCPv4 & v6  |  |  | Kea DHCPv4 & v6  |               |
-| | Server Processes |  |  | Server Processes |               |
-| +------------------+  |  +------------------+               |
-|      (Listens on      |      (Listens on                    |
-|      veth-ns-red)     |      veth-ns-blue)                  |
-|                       |                                     |
-|  RED Namespace        |  BLUE Namespace                     |
-+-----------------------+-------------------------------------+
-```
+This will install the necessary Kea components, including `perfdhcp` (usually at `/usr/sbin/perfdhcp`).
 
-### Component Breakdown
+### 2. Prepare Host Network
 
--   **`build.sh` (The Entry Point):** A robust shell script that prepares the host system, performs a clean build, and executes the final binary with the correct permissions. It handles:
-    1.  Forceful cleanup of any leftover resources from previous runs.
-    2.  Tuning kernel neighbor table parameters (`sysctl`) to handle high client counts.
-    3.  Running `cmake` and `make`.
-    4.  Executing the final `netns_sim` binary with `sudo`.
+The simulated clients connect to the host network via virtual Ethernet (veth) pairs. The host-facing end of these veth pairs needs to be connected to the network segment where your DHCP server(s) reside.
 
--   **`main.c` (The Orchestrator):** The main C program that controls the entire simulation lifecycle from start to finish. It is responsible for calling the other modules in the correct, deterministic sequence.
+A common way to achieve this is to use a **Linux bridge**:
 
--   **`netns_manager.c` (The Plumber):** A toolkit responsible for all network setup and teardown. It exclusively uses `system()` calls to the `iproute2` (`ip`) and `sysctl` command-line tools. This "hybrid" approach was chosen over pure `libnl` because it proved to be more reliable and portable, especially in virtualized environments like WSL2 where low-level netlink library calls can behave unexpectedly. It includes a critical `is_interface_ready` polling function to ensure network links are fully operational before use.
-
--   **`dhcp_crafter.h` (The Data Model):** This header defines the two most important data structures:
-    -   `client_state_t`: An `enum` that defines the states of the DORA (v4) and SARR (v6) state machines.
-    -   `simulated_client`: A `struct` that holds all state for a single simulated client, including its MAC address, VCI, transaction IDs, and leased IPs for both protocols.
-
--   **`dhcp_crafter_v4.c` (The DHCPv4 Client):**
-    -   Uses `AF_PACKET` raw sockets to have complete control over the Ethernet frame.
-    -   Crucially, it attaches a **BPF filter** to the socket. This filter instructs the kernel to deliver all IP/UDP packets for ports 67 and 68 directly to this socket, bypassing the kernel's normal IP stack. This prevents the kernel from generating `ICMP Port Unreachable` messages when it sees a DHCP Offer broadcast, which would otherwise disrupt the simulation.
-
--   **`dhcp_crafter_v6.c` (The DHCPv6 Client):**
-    -   Uses `AF_INET6` standard UDP sockets (`SOCK_DGRAM`). This is the architecturally correct approach for DHCPv6.
-    -   DHCPv6 servers often reply with a **unicast** `ADVERTISE` packet. A raw `AF_PACKET` socket is not designed to reliably receive unicast IP traffic destined for its own MAC address without complex filtering. A UDP socket, when bound to the DHCPv6 client port (`546`), allows the kernel to handle all Neighbor Discovery and routing, ensuring the unicast replies are delivered correctly to our application. This solves the "Port Unreachable" problem seen in the `tshark` captures.
-
----
-
-## Code Flow (Execution Walkthrough)
-
-The `main` function executes the following sequence:
-
-1.  **Initial Cleanup:** `cleanup_all_environments()` is called to remove any namespaces or `veth` pairs left over from a previous or crashed run.
-2.  **Environment Setup:** `setup_all_environments()` orchestrates the creation of the networks:
-    1.  `setup_namespace_environment("red", ...)` is called. This function:
-        -   Creates the `red` namespace and the `veth-r-red`/`veth-ns-red` pair.
-        -   Moves `veth-ns-red` into the namespace.
-        -   Disables IPv6 Duplicate Address Detection (DAD) on the interface for stability.
-        -   Assigns two IPv4 and two IPv6 addresses to `veth-ns-red`, making it a multi-homed interface.
-        -   Brings both `veth-ns-red` (inside the namespace) and `veth-r-red` (in the root) to the `UP` state.
-        -   Polls the interface state until it is confirmed to be fully operational.
-    2.  The same process is repeated for the `blue` namespace.
-3.  **Start Kea Servers:** Four Kea processes (v4 and v6 for both red and blue) are started in the background inside their respective namespaces using `run_command_in_ns()`. A `sleep()` gives them time to initialize.
-4.  **Start Packet Captures:** `start_packet_captures()` forks two `tcpdump` processes in the background, one for each root `veth` interface, saving the traffic to `.pcap` files.
-5.  **Run Simulations:** `run_all_simulations()` is called.
-    -   It initializes the client data structures for the `red` namespace.
-    -   It calls `perform_concurrent_dhcpv4()` and `perform_concurrent_dhcpv6()`, which contain the main `epoll` event loops that drive the client state machines.
-    -   It repeats the process for the `blue` namespace.
-6.  **Stop Packet Captures:** `stop_packet_captures()` reads the saved PIDs of the `tcpdump` processes and sends them a `SIGINT` to terminate them gracefully, ensuring all captured packets are flushed to disk.
-7.  **Pause for Inspection:** The program calls `getchar()` to pause, allowing the user to examine the logs and `.pcap` files before the environment is destroyed.
-8.  **Final Cleanup:** After the user presses Enter, `cleanup_all_environments()` is called again to return the system to its original state.
-
----
-
-## Kea IP Address & Lease Logic
-
-This simulator is specifically designed to test a powerful Kea feature for handling multiple subnets on a single physical network segment.
-
-#### General Kea Principles
-
--   **Client Classification:** Kea can inspect any part of an incoming DHCP packet to assign the client to a "class". In our case, we use the **Vendor Class Identifier (VCI, Option 60 for v4; Option 16 for v6)**. Our C code crafts packets with unique VCI strings like `"red-client-class-1"`. The Kea config has `client-classes` definitions with `test` expressions to match these strings.
--   **Pools and Subnets:** A `subnet` block defines a logical IP network (e.g., `10.10.10.0/24`). A `pool` within that subnet defines a range of addresses that can be leased to clients (e.g., `10.10.10.100 - 10.10.149`).
--   **Shared Networks:** This is the key concept being tested. A `shared-networks` block tells Kea that all the `subnet` blocks defined inside it are accessible on the *same physical link*. This is essential for our setup where the `veth-ns-red` interface has IP addresses in two different subnets.
-
-#### How Kea Assigns an IP in This Simulation
-
-Let's trace the logic for **Client 2** in the `red` namespace, which has the VCI `"red-client-class-2"`.
-
-1.  **Packet Arrival:** The `DISCOVER` packet arrives on `veth-ns-red`.
-2.  **Shared Network Identification:** Kea sees the interface is part of the `red-shared-network`. It now knows that it can consider *any* subnet within this shared block for the client.
-3.  **Classification:** Kea inspects Option 60, finds `"red-client-class-2"`, and successfully classifies the client into the `RED_CLIENT_TYPE_2` class.
-4.  **Subnet Selection:** Kea iterates through the subnets inside the shared network:
-    -   **Subnet 1 (`10.10.10.0/24`):** It checks the subnet's restriction: `client-classes: ["RED_CLIENT_TYPE_1"]`. The client's class (`RED_CLIENT_TYPE_2`) does not match. Kea discards this subnet as a possibility.
-    -   **Subnet 2 (`10.10.11.0/24`):** It checks the subnet's restriction: `client-classes: ["RED_CLIENT_TYPE_2"]`. **This is a match!**
-5.  **Lease Offer:** Because a matching subnet was found, Kea allocates an available IP from that subnet's pool (e.g., `10.10.11.100`) and sends the `DHCPOFFER`.
-
-This demonstrates that the combination of `shared-networks` and `client-classes` allows a single Kea server to correctly route clients to different logical subnets based on their identity, even when they all exist on the same physical link.
-
----
-
-## Prerequisites & How to Run
-
-You must be on a Debian-based system (e.g., Ubuntu 22.04+) or a bare-metal Linux server.
-
-1.  **Install Dependencies:**
+1.  **Create a bridge** (e.g., `br0`):
     ```bash
-    sudo apt-get update
-    sudo apt-get install build-essential cmake pkg-config iproute2 tcpdump \
-                         libnl-3-dev libnl-route-3-dev \
-                         kea-dhcp4-server kea-dhcp6-server
+    sudo ip link add name br0 type bridge
+    sudo ip link set dev br0 up
     ```
 
-2.  **Build and Run:**
-    Use the provided shell script. It handles cleanup, kernel tuning, building, and executing the simulator with the required permissions.
+2.  **Connect a physical interface to the bridge** (optional, if you want the bridge to connect to an external network):
+    Ensure your physical interface (e.g., `eth1`) is not configured with an IP address directly.
     ```bash
-    chmod +x build.sh
-    ./build.sh
+    # Example: removing IP from eth1 and adding it to br0
+    # sudo ip addr flush dev eth1
+    # sudo ip link set dev eth1 master br0
+    # sudo ip addr add <your_network_ip_for_bridge>/<prefix> dev br0
     ```
+    Alternatively, if the DHCP server is running on the same host, the bridge might not need an external physical interface, but it will still need an IP in the server's subnet if the server is configured to listen on that bridge IP.
 
-3.  **Analyze Results:**
-    -   Follow the console output for the live status of the simulation.
-    -   After the simulation completes, inspect the generated packet capture files in the `build/` directory using Wireshark or `tshark`:
-        ```bash
-        tshark -r build/red_capture.pcap
-        tshark -r build/blue_capture.pcap
-        ```
+    When running `dhcp_simulator.py`, you will specify this bridge interface using the `--host-iface br0` argument. The script will then automatically connect the host-side veth pairs of the simulated clients to this bridge.
+
+### 3. Configure Target DHCP Server(s)
+
+Ensure your DHCPv4 and/or DHCPv6 servers are configured to serve leases on the network segment connected to `--host-iface`.
+
+*   **Example Kea DHCPv4 Configuration Snippet (`kea-dhcp4.conf`)**:
+    ```json
+    "Dhcp4": {
+        "interfaces-config": {
+            "interfaces": [ "br0" ] // Or the interface Kea should listen on
+        },
+        "lease-database": {
+            "type": "memfile",
+            "lfc-interval": 3600
+        },
+        "subnet4": [
+            {
+                "subnet": "192.168.100.0/24",
+                "pools": [ { "pool": "192.168.100.10 - 192.168.100.200" } ],
+                "option-data": [
+                    { "name": "routers", "data": "192.168.100.1" }
+                ]
+            }
+        ]
+    }
+    ```
+*   Start your Kea server(s) (e.g., `sudo systemctl start isc-kea-dhcp4-server`).
+
+## Usage
+
+Run the simulator script with `sudo`:
+
+```bash
+sudo python3 dhcp_simulator.py --num-clients <N> --host-iface <interface_name> [options]
+```
+
+### Command-Line Arguments
+
+*   `--num-clients N`: (int, **required**) Number of dual-stack clients to simulate.
+*   `--host-iface IFACE`: (str, **required**) Host-side network interface or bridge (e.g., `br0`) to connect clients to.
+*   `--dhcpv4-server IP`: (str, optional) IP address of the DHCPv4 server. Skips v4 simulation if not provided.
+*   `--dhcpv6-server IP_OR_ALIAS`: (str, optional) IP address of the DHCPv6 server, or 'all'/'servers' for multicast. Skips v6 simulation if not provided.
+*   `--rate R`: (int, default: 10) Target requests per second per client (for each protocol).
+*   `--duration T`: (int, default: 60) Duration of the test in seconds for each client.
+*   `--v4-template FILE`: (str, optional) Path to a custom DHCPv4 packet template file for `perfdhcp`.
+*   `--v6-template FILE`: (str, optional) Path to a custom DHCPv6 packet template file for `perfdhcp`.
+*   `--perfdhcp-path PATH`: (str, default: `/usr/sbin/perfdhcp`) Path to the `perfdhcp` executable.
+*   `--output-dir DIR`: (str, default: `perfdhcp_results`) Directory to store `perfdhcp` output logs.
+*   `--base-mac AA:BB:CC:DD:EE:00`: (str, optional) Base MAC for DHCPv4 clients. The script increments the last octet for each client.
+*   `--base-duid DUID_HEX`: (str, optional) Base DUID (hex string) for DHCPv6 clients. The script attempts to increment the last byte for uniqueness.
+
+### Example
+
+Simulate 5 dual-stack clients connecting via `br0`, targeting a local DHCPv4 server at `192.168.100.1` and any DHCPv6 server via multicast, for 30 seconds:
+
+```bash
+sudo python3 dhcp_simulator.py \
+    --num-clients 5 \
+    --host-iface br0 \
+    --dhcpv4-server 192.168.100.1 \
+    --dhcpv6-server all \
+    --duration 30 \
+    --output-dir ./client_logs
+```
+
+## Output and Logs
+
+*   The script will print status messages to the console during setup, execution, and cleanup.
+*   A summary of successful/failed simulations for DHCPv4 and DHCPv6 will be printed at the end.
+*   Detailed logs from each `perfdhcp` instance are stored in the directory specified by `--output-dir` (default: `perfdhcp_results`).
+    *   Log files are named `client_<id>_v4.log` and `client_<id>_v6.log`.
+    *   These logs contain the raw output of `perfdhcp`, including statistics on packets sent/received, lease times, etc.
+
+## Troubleshooting
+
+*   **Permissions**: Ensure the script is run with `sudo`.
+*   **`perfdhcp` not found**: Verify `perfdhcp` is installed and `--perfdhcp-path` is correct.
+*   **No DHCP Offers/Advertisements**:
+    *   Check if your DHCP server is running and configured for the correct subnet.
+    *   Verify the `--host-iface` (e.g., bridge `br0`) is correctly set up and can reach the DHCP server.
+    *   Check firewall rules on the host or DHCP server machine.
+    *   Inspect `tcpdump` or Wireshark on the `--host-iface` or on the DHCP server's interface to see if DHCP packets are flowing as expected.
+*   **Namespace/veth errors**: Errors from `ip netns` or `ip link` commands usually indicate issues with setup or cleanup. The script attempts to clean up resources, but manual cleanup might occasionally be needed if the script exits prematurely:
+    *   List namespaces: `sudo ip netns list`
+    *   Delete a namespace: `sudo ip netns del <namespace_name>`
+    *   List links: `ip link show`
+    *   Delete a veth interface: `sudo ip link del <veth_host_name>`
+
+## Running with Docker
+
+This simulator can also be run inside a Docker container. This requires building a Docker image that includes all dependencies and the simulator scripts.
+
+### 1. Build the Docker Image
+
+A `Dockerfile` is provided. To build the image, navigate to the directory containing the `Dockerfile`, `setup_kea.sh`, and `dhcp_simulator.py`, then run:
+
+```bash
+docker build -t dhcp-simulator .
+```
+This command builds an image named `dhcp-simulator`. The build process includes running `setup_kea.sh` to install Kea and `perfdhcp` inside the image.
+
+### 2. Run the Docker Container
+
+Running the simulator inside Docker requires giving the container special privileges to manage network namespaces and interfaces. The `--network=host` option is also recommended to allow the simulator to interact with host network interfaces (like a host bridge) as intended by the script's design.
+
+**Example `docker run` command:**
+
+```bash
+docker run --rm -it \
+    --cap-add=NET_ADMIN \
+    --cap-add=SYS_ADMIN \
+    --network=host \
+    -v $(pwd)/my_client_logs:/app/perfdhcp_results \
+    dhcp-simulator \
+    --num-clients 2 \
+    --host-iface br0 \
+    --dhcpv4-server 192.168.100.1 \
+    --output-dir /app/perfdhcp_results
+    # Add other dhcp_simulator.py arguments as needed
+```
+
+**Explanation of `docker run` options:**
+
+*   `--rm`: Automatically removes the container when it exits.
+*   `-it`: Runs in interactive mode with a pseudo-TTY (useful for seeing output).
+*   `--cap-add=NET_ADMIN --cap-add=SYS_ADMIN`: Grants necessary capabilities to the container to manage network interfaces and namespaces. Alternatively, `--privileged` can be used for broader permissions, but it's less secure.
+*   `--network=host`: The container shares the host's network stack. This allows `dhcp_simulator.py` (running inside the container) to directly see and manipulate host interfaces specified by `--host-iface` (e.g., a bridge `br0` on the host).
+*   `-v $(pwd)/my_client_logs:/app/perfdhcp_results`: Mounts a directory from your host (`$(pwd)/my_client_logs`) into the container at `/app/perfdhcp_results`. The simulator script saves its logs to `/app/perfdhcp_results` (if `--output-dir` is set to that, which is the default if running from `/app`), so this makes the logs persistent on your host machine.
+*   `dhcp-simulator`: The name of the Docker image built in the previous step.
+*   The arguments after the image name (`--num-clients 2 ...`) are passed directly to the `dhcp_simulator.py` script.
+    *   **Important**: If you use `-v` to mount an output directory, ensure the `--output-dir` argument passed to `dhcp_simulator.py` matches the *container-side path* of that volume mount (e.g., `/app/perfdhcp_results`).
+
+### Considerations for Docker Networking
+
+*   **`--network=host`**: This is the simplest way to allow the script to function as designed, by giving it access to the host's network interfaces. The `--host-iface` argument should then refer to an interface or bridge that exists on the Docker host (e.g., `br0` that you would have set up as per the "Prepare Host Network" section for non-Docker use).
+*   **Alternative Docker Networks**: If you avoid `--network=host`, allowing the containerized script to manage veth pairs that connect to a *host-level* bridge or interface becomes significantly more complex. It would likely involve manually creating one side of a veth pair on the host and passing the other side into the container, then instructing the script to use that passed-in interface. This level of integration is not covered by the current script's automatic setup.
+*   **Internal `sudo`**: The `dhcp_simulator.py` script uses `sudo` for `ip` commands. The Docker container runs as `root` by default, and the `Dockerfile` ensures `sudo` is available and passwordless for root, so these commands will execute correctly.
+```
