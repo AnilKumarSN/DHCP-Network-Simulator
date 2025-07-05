@@ -686,14 +686,44 @@ action_status() {
 
 
 # --- Main script logic ---
+
+PYRELAY_LOG_LEVEL="info" # Default log level for python relay
+
+# Parse command-line options for kea_server_setup.sh itself
+while getopts ":l:" opt; do
+  case ${opt} in
+    l )
+      PYRELAY_LOG_LEVEL=$OPTARG
+      ;;
+    \? )
+      echo "Invalid Option: -$OPTARG" 1>&2
+      echo "Usage: $0 [-l <pyrelay_log_level>] <start|stop|restart|status|cleanup>"
+      exit 1
+      ;;
+    : )
+      echo "Invalid Option: -$OPTARG requires an argument" 1>&2
+      echo "Usage: $0 [-l <pyrelay_log_level>] <start|stop|restart|status|cleanup>"
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND -1))
+
+
 if [ -z "$1" ]; then
-    echo "Usage: $0 <start|stop|restart|status|cleanup>"
+    echo "Usage: $0 [-l <pyrelay_log_level>] <start|stop|restart|status|cleanup>"
+    echo "  <pyrelay_log_level>: debug, info, warning, error, critical (default: info)"
     exit 1
 fi
 
-case "$1" in
+ACTION=$1
+
+# Pass PYRELAY_LOG_LEVEL to start_python_relay, it will then pass it to the python script.
+# This requires start_python_relay to accept it as an argument. Let's assume it does for now.
+
+case "$ACTION" in
     start)
-        action_start
+        action_start "$PYRELAY_LOG_LEVEL" # Pass it to action_start
         ;;
     stop)
         action_stop
@@ -701,7 +731,7 @@ case "$1" in
     restart)
         action_stop
         sleep 2
-        action_start
+        action_start "$PYRELAY_LOG_LEVEL" # Pass it to action_start
         ;;
     status)
         action_status
@@ -710,8 +740,8 @@ case "$1" in
         action_cleanup
         ;;
     *)
-        echo "Invalid action: $1"
-        echo "Usage: $0 <start|stop|restart|status|cleanup>"
+        echo "Invalid action: $ACTION"
+        echo "Usage: $0 [-l <pyrelay_log_level>] <start|stop|restart|status|cleanup>"
         exit 1
         ;;
 esac
