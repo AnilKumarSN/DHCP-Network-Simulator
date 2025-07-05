@@ -247,9 +247,33 @@ generate_kea_dhcp6_config() {
     local control_socket_path="$9"
 
     log_info "Generating Kea DHCPv6 config for $ns_name at $conf_file_path..."
+
+    local client_classes_config_v6=""
+    local subnet1_class_filter_v6=""
+    local subnet2_class_filter_v6=""
+
+    if [ "$ns_name" == "ns_red" ]; then
+        client_classes_config_v6=$(cat << EOCC
+        "client-classes": [
+            {
+                "name": "V6_VIDEO_USERS_CLASS",
+                "test": "relay6.interface-id == 'V6_VIDEO_LINK'"
+            },
+            {
+                "name": "V6_DATA_USERS_CLASS",
+                "test": "relay6.interface-id == 'V6_DATA_LINK'"
+            }
+        ],
+EOCC
+)
+        subnet1_class_filter_v6='"client-class": "V6_VIDEO_USERS_CLASS",'
+        subnet2_class_filter_v6='"client-class": "V6_DATA_USERS_CLASS",'
+    fi
+
     cat << EOF > "$conf_file_path"
 {
     "Dhcp6": {
+        ${client_classes_config_v6}
         "interfaces-config": {
             "interfaces": ["$interface_name"]
         },
@@ -274,10 +298,12 @@ generate_kea_dhcp6_config() {
                 "interface": "$interface_name",
                 "subnet6": [
                     {
+                        ${subnet1_class_filter_v6}
                         "subnet": "$subnet1_prefix",
                         "pools": [ { "pool": "$pool1_range" } ]
                     },
                     {
+                        ${subnet2_class_filter_v6}
                         "subnet": "$subnet2_prefix",
                         "pools": [ { "pool": "$pool2_range" } ]
                     }
