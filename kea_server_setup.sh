@@ -79,9 +79,9 @@ setup_server_namespace() {
     if [ -n "$ns_ip4_secondary" ]; then
         sudo ip netns exec "$ns_name" ip addr add "$ns_ip4_secondary" dev "$veth_ns" || { log_error "Failed to add secondary IPv4 $ns_ip4_secondary to $veth_ns in $ns_name"; exit 1; }
     fi
-    sudo ip netns exec "$ns_name" ip -6 addr add "$ns_ip6_primary" dev "$veth_ns" || { log_error "Failed to add primary IPv6 $ns_ip6_primary to $veth_ns in $ns_name"; exit 1; }
+    sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ns_ip6_primary}' dev '${veth_ns}'" || { log_error "Failed to add primary IPv6 $ns_ip6_primary to $veth_ns in $ns_name"; exit 1; }
      if [ -n "$ns_ip6_secondary" ]; then
-        sudo ip netns exec "$ns_name" ip -6 addr add "$ns_ip6_secondary" dev "$veth_ns" || { log_error "Failed to add secondary IPv6 $ns_ip6_secondary to $veth_ns in $ns_name"; exit 1; }
+        sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ns_ip6_secondary}' dev '${veth_ns}'" || { log_error "Failed to add secondary IPv6 $ns_ip6_secondary to $veth_ns in $ns_name"; exit 1; }
     fi
     log_info "Namespace $ns_name configured with veth $veth_ns and $veth_host attached to $bridge_name."
 }
@@ -112,7 +112,7 @@ setup_pyrelay_namespace() {
     read -r -a client_ips_array <<< "$client_ips_array_str"
     for ip_addr in "${client_ips_array[@]}"; do
         if [[ "$ip_addr" == *":"* ]]; then
-            sudo ip netns exec "$ns_name" ip -6 addr add "$ip_addr" dev "$veth_ns_c" || { log_error "Failed to add IPv6 $ip_addr to $veth_ns_c in $ns_name"; exit 1; }
+            sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ip_addr}' dev '${veth_ns_c}'" || { log_error "Failed to add IPv6 $ip_addr to $veth_ns_c in $ns_name"; exit 1; }
         else
             sudo ip netns exec "$ns_name" ip addr add "$ip_addr" dev "$veth_ns_c" || { log_error "Failed to add IPv4 $ip_addr to $veth_ns_c in $ns_name"; exit 1; }
         fi
@@ -129,7 +129,7 @@ setup_pyrelay_namespace() {
     read -r -a server_ips_array <<< "$server_ips_array_str"
     for ip_addr in "${server_ips_array[@]}"; do
          if [[ "$ip_addr" == *":"* ]]; then
-            sudo ip netns exec "$ns_name" ip -6 addr add "$ip_addr" dev "$veth_ns_s" || { log_error "Failed to add IPv6 $ip_addr to $veth_ns_s in $ns_name"; exit 1; }
+            sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ip_addr}' dev '${veth_ns_s}'" || { log_error "Failed to add IPv6 $ip_addr to $veth_ns_s in $ns_name"; exit 1; }
         else
             sudo ip netns exec "$ns_name" ip addr add "$ip_addr" dev "$veth_ns_s" || { log_error "Failed to add IPv4 $ip_addr to $veth_ns_s in $ns_name"; exit 1; }
         fi
