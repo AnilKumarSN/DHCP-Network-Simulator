@@ -242,7 +242,57 @@ This design allows the Python relay to act as a sophisticated policy enforcement
     sudo ./kea_server_setup.sh cleanup   # Stops processes and removes all network setup & runtime files
     ```
 
-## 7. Future Enhancements / Considerations
+## 7. End-to-End Testing with `run_e2e_tests.sh`
+
+An automated end-to-end test script, `run_e2e_tests.sh`, is provided to orchestrate the setup, execution of predefined test cases, basic verification, and cleanup of the entire environment.
+
+### 7.1. Purpose
+The `run_e2e_tests.sh` script aims to:
+*   Automate the startup of the Kea servers and Python relay.
+*   Run a series of DHCPv4 and DHCPv6 test scenarios using `dhcp_simulator.py` with specific client MACs/DUIDs.
+*   Perform basic verification of test success by checking `perfdhcp` client logs for lease acquisition.
+*   Automate the cleanup of the environment.
+*   Provide a summary of test pass/fail status.
+
+### 7.2. Prerequisites
+*   All prerequisites for the main environment (see Section 6.2).
+*   The `run_e2e_tests.sh`, `kea_server_setup.sh`, `dhcp_pyrelay.py`, and `dhcp_simulator.py` scripts should be in the same directory and executable.
+
+### 7.3. Usage
+```bash
+sudo ./run_e2e_tests.sh [options]
+```
+**Options:**
+*   `-p /path/to/perfdhcp`: Specify a custom path to the `perfdhcp` executable if it's not at the default `/usr/sbin/perfdhcp`.
+*   `-d`: Enable debug mode. This provides more verbose logging from the test wrapper script itself, including commands being executed and detailed verification steps.
+*   `--no-cleanup`: If this flag is present, the script will skip the final cleanup step (`kea_server_setup.sh cleanup`). This is useful for debugging, as it leaves the network environment and logs intact for manual inspection after the tests have run.
+
+### 7.4. Test Cases Covered
+The script currently executes the following predefined test cases:
+*   **DHCPv4 RED VRF - VIDEO Policy**: Client MAC `00:aa:01:...`, expects IP from `192.168.10.0/24`.
+*   **DHCPv4 RED VRF - DATA Policy**: Client MAC `00:aa:02:...`, expects IP from `192.168.11.0/24`.
+*   **DHCPv4 BLUE VRF - Generic**: Client MAC `00:bb:01:...`, expects IP from `192.168.20.0/24`.
+*   **DHCPv6 RED VRF - VIDEO Policy**: Client DUID (LLT based on MAC `00:aa:01:...`), expects IP from `fd00:red::/64`.
+*   **DHCPv6 RED VRF - DATA Policy**: Client DUID (LLT based on MAC `00:aa:02:...`), expects IP from `fd00:red:1::/64`.
+*   **DHCPv6 BLUE VRF - Generic**: Client DUID (LLT based on MAC `00:bb:01:...`), expects IP from `fd00:blue::/64`.
+
+### 7.5. Output
+*   The script logs its actions to standard output.
+*   `dhcp_simulator.py` (and thus `perfdhcp`) logs for each test run are stored in timestamped subdirectories under `e2e_test_results/`.
+*   A final summary of PASSED/FAILED tests is printed.
+*   The script exits with 0 if all tests pass, and 1 otherwise.
+
+### 7.6. Verification Logic
+Verification for each test case is primarily based on analyzing the output log from `perfdhcp` (via `dhcp_simulator.py`):
+1.  **Log File Existence**: Checks if the `perfdhcp` log file was created.
+2.  **"tests complete"**: Ensures `perfdhcp` reported completion.
+3.  **Leases Obtained**: Verifies that `perfdhcp` reported acquiring at least one lease.
+4.  **Error Indicators**: Checks for common error strings (e.g., "timeout", "failed to receive", "no offer") in the `perfdhcp` log. If such errors are found and no leases were obtained, the test is marked as failed. If errors are present but leases were obtained, a warning is issued.
+5.  **Subnet Pattern (Informational)**: A basic check for an expected IP subnet pattern within the log. Due to default `perfdhcp` logging behavior, not finding this pattern does not automatically fail the test if other criteria are met.
+
+For detailed debugging of relay or Kea server behavior, manual inspection of their respective logs (e.g., `/tmp/kea_rt/ns_pyrelay/pyrelay.log`, `/tmp/kea_rt/ns_red/*`) is still recommended, especially if a test case fails.
+
+## 8. Future Enhancements / Considerations
 *   **Configurable Python Relay Policy**: Load relay policies (MAC/DUID to VRF mapping, Option 82/Interface-ID values) from an external file (YAML/JSON) instead of hardcoding in `dhcp_pyrelay.py`.
 *   **Advanced Packet Manipulation**: Use a library like Scapy in `dhcp_pyrelay.py` for more complex DHCP option handling if needed.
 *   **Performance Optimization for Python Relay**: If `select`-based loop becomes a bottleneck under very high load, explore `asyncio` or multiprocessing/threading models.
