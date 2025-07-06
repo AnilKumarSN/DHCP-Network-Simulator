@@ -67,6 +67,13 @@ setup_server_namespace() {
     local bridge_name="$8"
 
     log_info "Setting up Kea server namespace $ns_name..."
+    log_info "Attempting to pre-delete namespace $ns_name if it exists..."
+    sudo ip netns del "$ns_name" >/dev/null 2>&1 || true
+    # Also attempt to delete the host-side veth if it exists from a previous unclean setup for this NS
+    # This is important because 'ip netns add' might succeed even if the veth can't be created later due to name conflict
+    log_info "Attempting to pre-delete veth $veth_host if it exists..."
+    sudo ip link del "$veth_host" >/dev/null 2>&1 || true
+
     sudo ip netns add "$ns_name" || { log_error "Failed to add namespace $ns_name"; exit 1; }
     sudo ip link add name "$veth_host" type veth peer name "$veth_ns" || { log_error "Failed to create veth pair for $ns_name"; exit 1; }
     sudo ip link set "$veth_ns" netns "$ns_name" || { log_error "Failed to move $veth_ns to $ns_name"; exit 1; }
@@ -109,6 +116,13 @@ setup_pyrelay_namespace() {
     local server_ips_array_str="192.168.100.50/24 fd00:main::50/64"
 
     log_info "Setting up Python relay namespace $ns_name..."
+    log_info "Attempting to pre-delete namespace $ns_name if it exists..."
+    sudo ip netns del "$ns_name" >/dev/null 2>&1 || true
+    log_info "Attempting to pre-delete veth $veth_host_c if it exists..."
+    sudo ip link del "$veth_host_c" >/dev/null 2>&1 || true
+    log_info "Attempting to pre-delete veth $veth_host_s if it exists..."
+    sudo ip link del "$veth_host_s" >/dev/null 2>&1 || true
+
     sudo ip netns add "$ns_name" || { log_error "Failed to add namespace $ns_name"; exit 1; }
 
     # Client-facing interface

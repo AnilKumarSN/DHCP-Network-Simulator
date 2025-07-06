@@ -240,4 +240,3 @@ int find_executable_dir()
     executable_dir[sizeof (executable_dir) - 1] = '\0';
     return 0;
 }
-
