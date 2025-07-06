@@ -79,9 +79,18 @@ setup_server_namespace() {
     if [ -n "$ns_ip4_secondary" ]; then
         sudo ip netns exec "$ns_name" ip addr add "$ns_ip4_secondary" dev "$veth_ns" || { log_error "Failed to add secondary IPv4 $ns_ip4_secondary to $veth_ns in $ns_name"; exit 1; }
     fi
-    sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ns_ip6_primary}' dev '${veth_ns}'" || { log_error "Failed to add primary IPv6 $ns_ip6_primary to $veth_ns in $ns_name"; exit 1; }
+
+    # Primary IPv6
+    local ip6_primary_addr_only
+    ip6_primary_addr_only=$(echo "$ns_ip6_primary" | cut -d'/' -f1)
+    sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ip6_primary_addr_only}/128' dev '${veth_ns}'" || { log_error "Failed to add primary IPv6 address ${ip6_primary_addr_only}/128 to $veth_ns in $ns_name"; exit 1; }
+    sudo ip netns exec "$ns_name" bash -c "ip -6 route add '${ns_ip6_primary}' dev '${veth_ns}'" || { log_error "Failed to add primary IPv6 route $ns_ip6_primary via $veth_ns in $ns_name"; exit 1; }
+
      if [ -n "$ns_ip6_secondary" ]; then
-        sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ns_ip6_secondary}' dev '${veth_ns}'" || { log_error "Failed to add secondary IPv6 $ns_ip6_secondary to $veth_ns in $ns_name"; exit 1; }
+        local ip6_secondary_addr_only
+        ip6_secondary_addr_only=$(echo "$ns_ip6_secondary" | cut -d'/' -f1)
+        sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ip6_secondary_addr_only}/128' dev '${veth_ns}'" || { log_error "Failed to add secondary IPv6 address ${ip6_secondary_addr_only}/128 to $veth_ns in $ns_name"; exit 1; }
+        sudo ip netns exec "$ns_name" bash -c "ip -6 route add '${ns_ip6_secondary}' dev '${veth_ns}'" || { log_error "Failed to add secondary IPv6 route $ns_ip6_secondary via $veth_ns in $ns_name"; exit 1; }
     fi
     log_info "Namespace $ns_name configured with veth $veth_ns and $veth_host attached to $bridge_name."
 }
@@ -110,11 +119,14 @@ setup_pyrelay_namespace() {
     sudo ip link set "$veth_host_c" up || { log_error "Failed to bring up $veth_host_c"; exit 1; }
     sudo ip netns exec "$ns_name" ip link set dev "$veth_ns_c" up
     read -r -a client_ips_array <<< "$client_ips_array_str"
-    for ip_addr in "${client_ips_array[@]}"; do
-        if [[ "$ip_addr" == *":"* ]]; then
-            sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ip_addr}' dev '${veth_ns_c}'" || { log_error "Failed to add IPv6 $ip_addr to $veth_ns_c in $ns_name"; exit 1; }
-        else
-            sudo ip netns exec "$ns_name" ip addr add "$ip_addr" dev "$veth_ns_c" || { log_error "Failed to add IPv4 $ip_addr to $veth_ns_c in $ns_name"; exit 1; }
+    for full_ip_cidr in "${client_ips_array[@]}"; do
+        if [[ "$full_ip_cidr" == *":"* ]]; then # IPv6
+            local ip_only
+            ip_only=$(echo "$full_ip_cidr" | cut -d'/' -f1)
+            sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ip_only}/128' dev '${veth_ns_c}'" || { log_error "Failed to add IPv6 address ${ip_only}/128 to $veth_ns_c in $ns_name"; exit 1; }
+            sudo ip netns exec "$ns_name" bash -c "ip -6 route add '${full_ip_cidr}' dev '${veth_ns_c}'" || { log_error "Failed to add IPv6 route $full_ip_cidr via $veth_ns_c in $ns_name"; exit 1; }
+        else # IPv4
+            sudo ip netns exec "$ns_name" ip addr add "$full_ip_cidr" dev "$veth_ns_c" || { log_error "Failed to add IPv4 $full_ip_cidr to $veth_ns_c in $ns_name"; exit 1; }
         fi
     done
     log_info "Python Relay NS $ns_name: client interface $veth_ns_c configured."
@@ -127,11 +139,14 @@ setup_pyrelay_namespace() {
     sudo ip link set "$veth_host_s" up || { log_error "Failed to bring up $veth_host_s"; exit 1; }
     sudo ip netns exec "$ns_name" ip link set dev "$veth_ns_s" up
     read -r -a server_ips_array <<< "$server_ips_array_str"
-    for ip_addr in "${server_ips_array[@]}"; do
-         if [[ "$ip_addr" == *":"* ]]; then
-            sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ip_addr}' dev '${veth_ns_s}'" || { log_error "Failed to add IPv6 $ip_addr to $veth_ns_s in $ns_name"; exit 1; }
-        else
-            sudo ip netns exec "$ns_name" ip addr add "$ip_addr" dev "$veth_ns_s" || { log_error "Failed to add IPv4 $ip_addr to $veth_ns_s in $ns_name"; exit 1; }
+    for full_ip_cidr in "${server_ips_array[@]}"; do
+         if [[ "$full_ip_cidr" == *":"* ]]; then # IPv6
+            local ip_only
+            ip_only=$(echo "$full_ip_cidr" | cut -d'/' -f1)
+            sudo ip netns exec "$ns_name" bash -c "ip -6 addr add '${ip_only}/128' dev '${veth_ns_s}'" || { log_error "Failed to add IPv6 address ${ip_only}/128 to $veth_ns_s in $ns_name"; exit 1; }
+            sudo ip netns exec "$ns_name" bash -c "ip -6 route add '${full_ip_cidr}' dev '${veth_ns_s}'" || { log_error "Failed to add IPv6 route $full_ip_cidr via $veth_ns_s in $ns_name"; exit 1; }
+        else # IPv4
+            sudo ip netns exec "$ns_name" ip addr add "$full_ip_cidr" dev "$veth_ns_s" || { log_error "Failed to add IPv4 $full_ip_cidr to $veth_ns_s in $ns_name"; exit 1; }
         fi
     done
     log_info "Python Relay NS $ns_name: server interface $veth_ns_s configured."
